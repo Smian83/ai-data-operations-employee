@@ -13,7 +13,7 @@ pydantic-settings==2.7.1
 # Database
 sqlalchemy==2.0.37
 alembic==1.14.1
-psycopg[binary]==3.2.4
+psycopg[binary]==3.3.4
 
 # Environment / config
 python-dotenv==1.0.1
