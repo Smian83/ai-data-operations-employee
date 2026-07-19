@@ -1,0 +1,45 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: aidataops_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aidataops}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-aidataops}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aidataops} -d ${POSTGRES_DB:-aidataops}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - aidataops_net
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: aidataops_app
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aidataops}:${POSTGRES_PASSWORD:-changeme_dev_password}@db:5432/${POSTGRES_DB:-aidataops}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - aidataops_net
+
+volumes:
+  postgres_data:
+
+networks:
+  aidataops_net:
+    driver: bridge

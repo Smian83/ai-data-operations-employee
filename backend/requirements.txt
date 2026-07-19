@@ -1,0 +1,22 @@
+# =============================================================================
+# Production dependencies — pinned for reproducible builds
+# =============================================================================
+
+# Web framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+
+# Data validation / settings
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy==2.0.37
+alembic==1.14.1
+psycopg[binary]==3.2.4
+
+# Environment / config
+python-dotenv==1.0.1
+
+# Structured logging
+python-json-logger==3.2.1

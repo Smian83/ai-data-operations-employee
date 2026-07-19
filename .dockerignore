@@ -1,0 +1,15 @@
+**/.venv/
+**/venv/
+**/__pycache__/
+**/*.pyc
+.git/
+.gitignore
+.env
+**/*.db
+**/.pytest_cache/
+**/.coverage
+**/htmlcov/
+frontend/node_modules/
+tests/
+docs/
+README.md
