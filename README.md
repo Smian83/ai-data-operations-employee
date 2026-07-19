@@ -64,9 +64,33 @@ ai-data-operations-employee/
 
 ## Prerequisites
 
-- Python 3.10+
+- **Python 3.13** (required — see "Why Python 3.13" below)
 - Docker Desktop (or Docker Engine + Docker Compose plugin)
 - Git
+
+### Why Python 3.13
+
+This project officially targets **Python 3.13**, pinned via `.python-version` and
+the `docker/Dockerfile` base image (`python:3.13-slim`).
+
+- **Not 3.14:** Python 3.14 is very new. Two of our pinned production dependencies
+  (`psycopg[binary]`, and transitively `pydantic`/`pydantic-core`) either lacked
+  `cp314` wheels outright or only gained them in versions released within the last
+  ~2 months, forcing pip to compile from source (which requires a full C/Rust
+  toolchain — e.g. Visual Studio Build Tools on Windows). We don't want production
+  installs depending on a toolchain being present. 3.13 has ~1.5 years of ecosystem
+  wheel coverage and every currently pinned dependency has verified prebuilt wheels
+  for it.
+- **Not 3.12:** Not required. It offers no advantage over 3.13 for this project's
+  dependencies, and 3.13 is already what's recommended, so there's no reason to
+  install an additional interpreter.
+
+If you have multiple Python versions installed on Windows, create the virtual
+environment explicitly with the `py` launcher:
+
+```powershell
+py -3.13 -m venv backend\.venv
+```
 
 ## Local Development Setup
 
@@ -108,10 +132,12 @@ docker compose down -v
 
 ### 4. Run natively (without Docker)
 
+Requires Python 3.13 (see "Why Python 3.13" above).
+
 ```bash
 cd backend
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+python3.13 -m venv .venv            # Windows: py -3.13 -m venv .venv
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
 # Requires a reachable Postgres instance matching DATABASE_URL in .env
