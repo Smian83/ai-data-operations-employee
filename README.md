@@ -31,14 +31,21 @@ ai-data-operations-employee/
 │   │   ├── main.py               # App factory / entrypoint
 │   │   ├── core/
 │   │   │   ├── config.py         # Pydantic settings (env-driven)
-│   │   │   └── logging.py        # Structured logging configuration
+│   │   │   ├── logging.py        # Structured logging configuration
+│   │   │   ├── security.py       # Password hashing, JWT, slug generation
+│   │   │   └── validation.py     # Secret-key denylist, name normalization
 │   │   ├── api/
-│   │   │   └── health.py         # GET /health
+│   │   │   ├── health.py         # GET /health
+│   │   │   ├── auth.py           # /auth/register, /login, /me
+│   │   │   ├── deps.py           # get_current_active_user, pagination
+│   │   │   ├── data_sources.py   # /data-sources CRUD
+│   │   │   └── tasks.py          # /tasks CRUD + /tasks/{id}/runs
 │   │   ├── db/
 │   │   │   ├── base.py           # Declarative base
 │   │   │   └── session.py        # Engine / session factory
-│   │   ├── models/               # SQLAlchemy ORM models (empty in Module 1)
-│   │   └── schemas/              # Pydantic request/response schemas
+│   │   ├── models/                # organization, user, data_source, task,
+│   │   │                          # task_run, enums
+│   │   └── schemas/               # Pydantic request/response schemas
 │   ├── requirements.txt          # Production dependencies (pinned)
 │   └── requirements-dev.txt      # + testing dependencies
 ├── frontend/                     # Reserved for a future module
@@ -46,7 +53,7 @@ ai-data-operations-employee/
 │   ├── alembic.ini
 │   └── alembic/
 │       ├── env.py
-│       └── versions/
+│       └── versions/              # organizations+users, data_sources+tasks+task_runs
 ├── docker/
 │   ├── Dockerfile                # Multi-stage production image
 │   └── .dockerignore
@@ -54,7 +61,10 @@ ai-data-operations-employee/
 ├── docs/                         # Project documentation
 ├── tests/
 │   ├── conftest.py
-│   └── test_health.py
+│   ├── test_health.py
+│   ├── test_auth.py
+│   ├── test_data_sources.py
+│   └── test_tasks.py
 ├── scripts/
 │   └── wait_for_postgres.py      # Startup dependency check
 ├── pytest.ini
@@ -282,6 +292,63 @@ Returns the current user. `401` with no/invalid token, `403` if inactive.
 - A JWT encodes both the user id (`sub`) and `org_id`. On every request,
   `org_id` is re-checked against the user's *current* `organization_id` in
   the database, not just trusted from the token.
+
+## Data Sources & Tasks (Module 3)
+
+Core domain model: each organization can register **Data Sources** (systems
+the AI agent will operate on) and define **Tasks** against them. This module
+only models and CRUDs these — actually executing a task is future work
+(Module 4). All endpoints require a Bearer token (see Authentication above)
+and are strictly scoped to the caller's organization.
+
+### Data Sources
+
+```bash
+curl -X POST http://localhost:8000/data-sources \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"name": "Prod Postgres", "source_type": "postgres", "connection_metadata": {"host": "db.internal"}}'
+```
+
+`source_type` is one of `postgres`, `mysql`, `rest_api`, `csv_upload`, `s3`, `other`
+— enforced by a native PostgreSQL enum type, not just request validation.
+
+**`connection_metadata` must never contain secrets.** Keys that look like
+credentials (`password`, `token`, `api_key`, `secret`, etc. — checked
+recursively) are rejected with `422`. Real credential storage is a future
+encrypted secrets module; this is metadata only (host, port, bucket name, etc).
+
+`GET/PATCH/DELETE /data-sources/{id}` and `GET /data-sources` (paginated,
+`limit`/`offset`, default 50 / max 100) — standard CRUD. `DELETE` is a soft
+delete (`is_active=False`); afterwards the resource behaves exactly like it
+doesn't exist for every operation (`404`, including inactive results being
+excluded from `GET /data-sources` unless `?include_inactive=true`). Names
+are unique per organization, case-insensitively, among active resources only
+— deleting a data source frees its name for reuse.
+
+### Tasks
+
+```bash
+curl -X POST http://localhost:8000/tasks \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"name": "Nightly Sync", "task_type": "sync", "data_source_id": "<data-source-id>"}'
+```
+
+`task_type` is one of `sync`, `transform`, `export`, `other`. `data_source_id`
+is optional; if given, it must reference an **active** data source in the
+**same organization** — enforced both by a PostgreSQL composite foreign key
+(`(organization_id, data_source_id) -> data_sources(organization_id, id)`,
+not just application code) and, for the "inactive" case, an application-level
+check. Either way the failure is `404`, identical to a non-existent reference.
+
+Same CRUD/pagination/soft-delete/case-insensitive-naming rules as Data Sources.
+
+### Task Runs
+
+`POST /tasks/{id}/runs` creates a run record in `pending` status — this is an
+enqueue stub, not execution (Module 4 territory). `GET /tasks/{id}/runs`
+(paginated) and `GET /tasks/{id}/runs/{run_id}` read run history. A run's
+`organization_id`, `task_id`, and `triggered_by` are always server-derived,
+never accepted from the client.
 
 ## Health Endpoint
 

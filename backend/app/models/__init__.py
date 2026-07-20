@@ -2,3 +2,6 @@
 (required for Alembic autogenerate and Base.metadata.create_all())."""
 from app.models.organization import Organization  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.models.data_source import DataSource  # noqa: F401
+from app.models.task import Task  # noqa: F401
+from app.models.task_run import TaskRun  # noqa: F401
