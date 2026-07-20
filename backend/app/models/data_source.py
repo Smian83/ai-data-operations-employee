@@ -24,11 +24,23 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 from app.models.enums import SourceType
 
+# create_type=False: Alembic migrations (database/alembic/versions/
+# e8e9044941dd_*.py) are the SOLE owner of this native PostgreSQL type's
+# lifecycle -- CREATE/DROP TYPE only ever happens there. Without this,
+# SQLAlchemy's default create_type=True means Base.metadata.create_all()
+# (used by tests/conftest.py against a live database) would independently
+# issue its own CREATE TYPE for this exact type name, outside Alembic's
+# tracking entirely -- a real "two owners" bug that surfaced as a
+# PostgreSQL DuplicateObject error during Module 4's real-Postgres
+# verification. create_constraint=True is unrelated and unaffected -- it
+# only governs the SQLite CHECK-constraint fallback (SQLite has no native
+# enum type at all), which this model must still provide.
 source_type_enum = SAEnum(
     SourceType,
     name="source_type_enum",
     values_callable=lambda obj: [e.value for e in obj],
     create_constraint=True,
+    create_type=False,
 )
 
 

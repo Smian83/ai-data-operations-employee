@@ -237,12 +237,24 @@ docker compose exec db psql -U aidataops -c "CREATE DATABASE aidataops_test;"
 
 backend\.venv\Scripts\activate
 $env:DATABASE_URL = "postgresql+psycopg://aidataops:<your POSTGRES_PASSWORD>@localhost:5432/aidataops_test"
+
+# Required as of Module 4: every native PostgreSQL enum type
+# (source_type_enum, task_type_enum, task_run_status_enum) is owned
+# exclusively by Alembic migrations (create_type=False on the ORM models —
+# see "Task Execution Engine" below for why). Base.metadata.create_all(),
+# which tests/conftest.py uses to build tables, therefore requires these
+# types to already exist. Run migrations against aidataops_test once
+# before the first test run against it:
+cd database; alembic upgrade head; cd ..
+
 $env:PYTHONPATH = "backend"
 pytest -v tests/
 ```
 
 Every test cleans up its own rows between tests (see `tests/conftest.py`),
-so this is safe to run repeatedly.
+so this is safe to run repeatedly. Re-running `alembic upgrade head` against
+`aidataops_test` on a subsequent session is also safe — it's a no-op once
+already at head.
 
 ## Authentication (Module 2)
 
@@ -443,6 +455,24 @@ format counters: `task_engine_tasks_claimed_total`,
 `task_engine_tasks_completed_total`, `task_engine_tasks_failed_total`,
 `task_engine_tasks_retried_total`, `task_engine_execution_duration_seconds`
 (histogram), `task_engine_queue_depth` (gauge, pending-run count).
+
+**Enum type ownership.** Every native PostgreSQL enum type in this project
+(`source_type_enum`, `task_type_enum`, `task_run_status_enum`) is owned
+exclusively by Alembic migrations — `CREATE TYPE`/`DROP TYPE` only ever
+happens in `database/alembic/versions/`. The corresponding ORM model
+`Enum(...)` objects set `create_type=False` explicitly, so
+`Base.metadata.create_all()` never attempts to create these types itself.
+This was fixed after real-PostgreSQL verification surfaced a
+`DuplicateObject` error: the models originally left `create_type` at
+SQLAlchemy's default (`True`), so `create_all()` (used by
+`tests/conftest.py` against a live database) and Alembic's migrations were
+both independently capable of creating the same type — whichever ran
+first would "win," and the other would collide, with no relationship to
+`alembic_version` tracking. `e8e9044941dd`'s own enum creation additionally
+uses a PostgreSQL-native guarded `DO $$ ... EXCEPTION WHEN duplicate_object
+...` block rather than relying solely on SQLAlchemy's `checkfirst`, so it
+is unconditionally safe to re-run even if `alembic_version` and the
+database's actual object state have drifted apart for any other reason.
 
 **Known limitations.** `FOR UPDATE SKIP LOCKED` concurrency safety is
 PostgreSQL-only and cannot be verified against the SQLite sandbox — treat

@@ -46,11 +46,16 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.db.base import Base
 from app.models.enums import TaskRunStatus
 
+# create_type=False: see the identical comment on source_type_enum in
+# app/models/data_source.py -- Alembic migrations own CREATE/DROP TYPE for
+# every native PostgreSQL enum in this project; models must never issue it
+# independently via Base.metadata.create_all().
 task_run_status_enum = SAEnum(
     TaskRunStatus,
     name="task_run_status_enum",
     values_callable=lambda obj: [e.value for e in obj],
     create_constraint=True,
+    create_type=False,
 )
 
 
