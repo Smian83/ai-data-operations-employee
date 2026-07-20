@@ -69,8 +69,6 @@ task_run_status_enum = SAEnum(
 class TaskRun(Base):
     __tablename__ = "task_runs"
     __table_args__ = (
-        # Tenant-aware composite FK: a TaskRun's organization_id must match
-        # its Task's organization_id, enforced by PostgreSQL.
         ForeignKeyConstraint(
             ["organization_id", "task_id"],
             ["tasks.organization_id", "tasks.id"],
@@ -91,28 +89,16 @@ class TaskRun(Base):
             "finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at",
             name="ck_task_runs_finished_after_started",
         ),
-        # Module 4: a running/claimed row must always carry a lease_token and
-        # a lease_expires_at (both set together on claim, both cleared
-        # together on any terminal/requeue transition). Prevents a
-        # half-claimed row (token without expiry, or vice versa) from ever
-        # being persisted.
         CheckConstraint(
             "(status = 'running' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)"
             " OR (status != 'running' AND lease_token IS NULL AND lease_expires_at IS NULL)",
             name="ck_task_runs_lease_consistency",
         ),
-        # Required so TaskRunEvent can have a tenant-aware composite FK
-        # (organization_id, task_run_id) -> (organization_id, id), same
-        # pattern as every other Module 3/4 parent table.
         UniqueConstraint("organization_id", "id", name="uq_task_runs_org_id"),
         UniqueConstraint("idempotency_key", name="uq_task_runs_idempotency_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
-    # Denormalized (also derivable via task_id -> tasks.organization_id) so
-    # that tenant-scoped queries on this — the highest-volume table — never
-    # depend on remembering to join through Task. Also what makes the
-    # composite tenant-aware FK to `tasks` possible.
     organization_id: Mapped[uuid.UUID] = mapped_column(
         Uuid(),
         ForeignKey("organizations.id", ondelete="CASCADE"),
@@ -134,7 +120,6 @@ class TaskRun(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    # --- Module 4: execution engine bookkeeping (all additive/nullable) ---
     idempotency_key: Mapped[uuid.UUID] = mapped_column(
         Uuid(), nullable=False, default=uuid.uuid4
     )
@@ -153,6 +138,9 @@ class TaskRun(Base):
     task: Mapped["Task"] = relationship(back_populates="runs")  # noqa: F821
     events: Mapped[list["TaskRunEvent"]] = relationship(  # noqa: F821
         back_populates="task_run", order_by="TaskRunEvent.created_at"
+    )
+    data_profile: Mapped["DataProfile | None"] = relationship(  # noqa: F821
+        back_populates="task_run", uselist=False
     )
 
     def __repr__(self) -> str:
