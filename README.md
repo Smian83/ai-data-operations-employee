@@ -155,9 +155,42 @@ alembic upgrade head
 alembic downgrade -1
 ```
 
+### Verifying a migration against real PostgreSQL (required — not optional)
+
+SQLite is used only for fast sandbox/unit-test iteration. It does not
+enforce the same constraint and transaction behavior as PostgreSQL, so
+every migration must also be verified against a real running Postgres
+container before being considered done. On Windows PowerShell:
+
+```powershell
+# 1. Start Postgres (and the app) via Docker
+docker compose up -d db
+
+# 2. Activate your venv
+backend\.venv\Scripts\activate
+
+# 3. Point alembic at the real Postgres container (mapped to localhost:5432)
+#    Use the same POSTGRES_PASSWORD you set in your .env file.
+$env:DATABASE_URL = "postgresql+psycopg://aidataops:<your POSTGRES_PASSWORD>@localhost:5432/aidataops"
+cd database
+alembic upgrade head
+cd ..
+
+# 4. Confirm the tables exist with the expected constraints
+docker compose exec db psql -U aidataops -d aidataops -c "\d organizations"
+docker compose exec db psql -U aidataops -d aidataops -c "\d users"
+```
+
+You should see the `uq_organizations_slug` unique constraint on
+`organizations`, and both the `uq_users_org_email` unique constraint and the
+`fk_users_organization_id_organizations` foreign key on `users`.
+
+To roll back: `alembic downgrade -1` (from the `database/` directory, with
+the same `DATABASE_URL` set).
+
 ## Running Tests
 
-From the repository root:
+From the repository root, against the fast SQLite fallback:
 
 ```bash
 cd backend
@@ -165,6 +198,90 @@ pip install -r requirements-dev.txt
 cd ..
 PYTHONPATH=backend pytest -v --cov=backend/app --cov-report=term-missing
 ```
+
+### Running the same suite against real PostgreSQL (required for Module 2)
+
+The exact same tests can run against your real Postgres container instead
+of SQLite — set `DATABASE_URL` before invoking pytest and it takes priority
+over the SQLite default. Use a **separate database** so tests never touch
+your dev data:
+
+```powershell
+docker compose up -d db
+docker compose exec db psql -U aidataops -c "CREATE DATABASE aidataops_test;"
+
+backend\.venv\Scripts\activate
+$env:DATABASE_URL = "postgresql+psycopg://aidataops:<your POSTGRES_PASSWORD>@localhost:5432/aidataops_test"
+$env:PYTHONPATH = "backend"
+pytest -v tests/
+```
+
+Every test cleans up its own rows between tests (see `tests/conftest.py`),
+so this is safe to run repeatedly.
+
+## Authentication (Module 2)
+
+Multi-tenant JWT authentication. Every user belongs to exactly one
+**organization** (tenant). Because email is only unique *within* an
+organization (not globally), login requires three fields, not two.
+
+### `POST /auth/register`
+
+Creates a new organization and its first (admin) user in one transaction,
+returns a token. Fails with `409` if the organization slug is already taken.
+
+```bash
+curl -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "organization_name": "Acme Corp",
+    "email": "owner@example.com",
+    "password": "correct-horse-battery",
+    "full_name": "Owner Person"
+  }'
+```
+
+`organization_slug` is optional — if omitted it's deterministically derived
+from `organization_name` (e.g. "Acme Corp" -> "acme-corp"). A colliding slug
+is always rejected with `409`, never silently modified.
+
+Password rules: minimum 8 characters, and must not exceed bcrypt's 72-byte
+(UTF-8 encoded) limit — passwords are never truncated, an oversized password
+is rejected with `422`.
+
+### `POST /auth/login`
+
+```bash
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "organization_slug": "acme-corp",
+    "email": "owner@example.com",
+    "password": "correct-horse-battery"
+  }'
+```
+
+Returns `401` for a wrong organization slug, unknown email, or wrong
+password (one generic error for all three, to avoid leaking which one was
+wrong). Returns `403` if the account exists but is inactive.
+
+### `GET /auth/me`
+
+```bash
+curl http://localhost:8000/auth/me -H "Authorization: Bearer <token>"
+```
+
+Returns the current user. `401` with no/invalid token, `403` if inactive.
+
+### Tenant isolation rules
+
+- Email is unique **per organization**, not globally — the same email can
+  register in two different organizations.
+- Emails and organization slugs are normalized (lowercased, trimmed) before
+  storage and comparison.
+- A JWT encodes both the user id (`sub`) and `org_id`. On every request,
+  `org_id` is re-checked against the user's *current* `organization_id` in
+  the database, not just trusted from the token.
 
 ## Health Endpoint
 
@@ -186,7 +303,9 @@ See `.env.example` for the full list. Key variables:
 | `DATABASE_URL`  | Full SQLAlchemy connection string for Postgres  |
 | `LOG_LEVEL`     | Minimum log level to emit                       |
 | `LOG_FORMAT`    | `json` (production) or `console` (development)  |
-| `SECRET_KEY`    | Application secret, used by future auth modules |
+| `SECRET_KEY`    | Application secret. Used to sign JWTs (Module 2) — generate a real 32+ byte random value before production, never commit it |
+| `JWT_ALGORITHM` | JWT signing algorithm (default `HS256`)          |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Access token lifetime in minutes (default `60`) |
 
 ## License
 

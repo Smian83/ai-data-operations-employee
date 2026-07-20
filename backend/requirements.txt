@@ -20,3 +20,8 @@ python-dotenv==1.0.1
 
 # Structured logging
 python-json-logger==3.2.1
+
+# Authentication (Module 2)
+bcrypt==5.0.0
+pyjwt==2.13.0
+email-validator==2.3.0
