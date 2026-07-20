@@ -45,15 +45,21 @@ ai-data-operations-employee/
 │   │   │   ├── base.py           # Declarative base
 │   │   │   └── session.py        # Engine / session factory
 │   │   ├── models/                # organization, user, data_source, task,
-│   │   │                          # task_run, task_run_event, data_source_credential, enums
+│   │   │                          # task_run, task_run_event, data_source_credential,
+│   │   │                          # data_profile (Module 5), enums
 │   │   ├── schemas/               # Pydantic request/response schemas
+│   │   ├── profiling/             # Module 5: pure CSV loading + profiling logic
+│   │   │   ├── csv_loader.py      # bounded, read-only, path-traversal-safe
+│   │   │   ├── csv_profiler.py    # deterministic, pure quality-metric calculation
+│   │   │   └── types.py           # CsvLimits / LoadedCsv / ProfileResult
 │   │   └── worker/                # Module 4: task execution engine
 │   │       ├── engine.py          # claim/heartbeat/complete (lease_token fencing)
 │   │       ├── reaper.py          # stuck-run recovery (expired leases)
 │   │       ├── credentials.py     # CredentialProvider abstraction
 │   │       ├── metrics.py         # Prometheus counters/gauges/histogram
 │   │       ├── runner.py          # worker process main loop
-│   │       └── handlers/          # ExecutionHandler registry + no-op handler
+│   │       └── handlers/          # ExecutionHandler registry (SYNC -> CSV
+│   │                              # profiling as of Module 5; others no-op)
 │   ├── requirements.txt          # Production dependencies (pinned)
 │   └── requirements-dev.txt      # + testing dependencies
 ├── frontend/                     # Reserved for a future module
@@ -62,7 +68,8 @@ ai-data-operations-employee/
 │   └── alembic/
 │       ├── env.py
 │       └── versions/              # organizations+users, data_sources+tasks+task_runs,
-│       │                          # task execution engine (Module 4)
+│       │                          # task execution engine (Module 4),
+│       │                          # data ingestion & profiling (Module 5)
 ├── docker/
 │   ├── Dockerfile                # Multi-stage production image
 │   └── .dockerignore
@@ -79,7 +86,10 @@ ai-data-operations-employee/
 │   ├── test_worker_credentials.py
 │   ├── test_worker_handlers.py
 │   ├── test_worker_metrics.py
-│   └── test_worker_api.py
+│   ├── test_worker_api.py
+│   ├── test_csv_loader.py
+│   ├── test_csv_profiler.py
+│   └── test_csv_profiling_handler.py
 ├── scripts/
 │   └── wait_for_postgres.py      # Startup dependency check
 ├── pytest.ini
@@ -483,6 +493,55 @@ is a recommended follow-up, not part of this module. There is no scheduler
 yet — the unused `schedule` column on `Task` stays unused until a future
 cron-driven module; runs are only created via `POST /tasks/{id}/runs`.
 
+## Data Ingestion & Profiling Engine (Module 5)
+
+The first real (non-diagnostic) execution handler: `TaskType.SYNC` now maps
+to `CsvProfilingHandler` instead of the Module 4 no-op — a deliberate
+behavior change, not a purely additive one. A `SYNC` task now requires an
+active `CSV_UPLOAD` data source and produces a real, immutable profiling
+result; against any other `source_type` it fails permanently rather than
+succeeding as a no-op. `TRANSFORM`, `EXPORT`, and `OTHER` are unaffected.
+
+**Loading.** `app/profiling/csv_loader.py` reads a CSV strictly read-only,
+bounded by `CSV_MAX_FILE_SIZE_BYTES` / `CSV_MAX_ROWS` / `CSV_MAX_COLUMNS` /
+`CSV_MAX_CELL_LENGTH`. `DataSource.connection_metadata.file_path` is always
+resolved relative to `CSV_INPUT_ROOT` (`resolve_source_path`) — an absolute
+path or any path that escapes that root is rejected outright, not sandboxed.
+Encoding is detected (UTF-8, with a UTF-8 BOM check) and hashed (SHA-256 of
+the raw bytes) before parsing; malformed rows are recorded as structural
+issues rather than silently dropped or crashing the load.
+
+**Profiling.** `app/profiling/csv_profiler.py` is a pure function: given a
+loaded CSV and the same limits, it deterministically computes row/column
+counts, duplicate rows, per-column missing-value and type-inference
+statistics (bounded sample and distinct-value lists via
+`CSV_MAX_DISTINCT_VALUES` / `CSV_MAX_SAMPLE_VALUES`), and structural issues
+(blank/duplicate headers, ragged rows, inconsistent column types). It never
+mutates its input and has no I/O of its own.
+
+**Persistence.** One immutable `DataProfile` row per `TaskRun`, enforced by
+`uq_data_profiles_task_run_id` at the database layer — the same
+tenant-aware composite-FK pattern as every other Module 3/4 table
+(`(organization_id, task_run_id/task_id/data_source_id)`, `RESTRICT` on the
+task/data-source FKs, `CASCADE` only from the owning TaskRun/organization).
+`CsvProfilingHandler` respects Module 4's idempotency contract without any
+change to the `ExecutionContext` interface: it checks for an existing
+profile by `task_run_id` first, and if a race loses to a concurrent insert
+(`IntegrityError` on the unique constraint), it re-fetches and returns the
+winner's profile rather than erroring — a retried run never produces two
+profiles. Read via `GET /tasks/{id}/runs/{run_id}/profile` (404 if the run
+isn't visible to the caller's org, or if no profile exists yet).
+
+**Known limitations.** CSV only — `SourceType.POSTGRES`/`MYSQL`/`REST_API`/
+`S3`/`OTHER` all still fail permanently under `SYNC`, per the explicit
+`PermanentExecutionError` in `CsvProfilingHandler.execute`; real connectors
+per source type are scoped follow-up work, same rationale as Module 4's
+single-handler rollout. Type inference (`app/profiling/csv_profiler.py`) is
+heuristic (boolean/integer/decimal/datetime/date/string, "mixed" when no
+type reaches an 80% majority) and not configurable per column. Files are
+read entirely into memory up to `CSV_MAX_FILE_SIZE_BYTES` (25 MB default) —
+true streaming for larger files is not implemented.
+
 ## Health Endpoint
 
 `GET /health` returns:
@@ -515,6 +574,10 @@ See `.env.example` for the full list. Key variables:
 | `WORKER_DEFAULT_MAX_ATTEMPTS` | Default max retry attempts (default `3`) |
 | `WORKER_RETRY_BASE_DELAY_SECONDS` / `WORKER_RETRY_MAX_DELAY_SECONDS` | Exponential backoff base/cap (default `30` / `900`) |
 | `REAPER_POLL_INTERVAL_SECONDS` | How often the reaper scans for expired leases (default `15`) |
+| `CSV_INPUT_ROOT` | Server-controlled root all CSV `file_path`s resolve against (default `./data/csv`) |
+| `CSV_MAX_FILE_SIZE_BYTES` | Max CSV size read into memory (default `26214400`, 25 MB) |
+| `CSV_MAX_ROWS` / `CSV_MAX_COLUMNS` / `CSV_MAX_CELL_LENGTH` | Bounds enforced during load (defaults `100000` / `500` / `100000`) |
+| `CSV_MAX_DISTINCT_VALUES` / `CSV_MAX_SAMPLE_VALUES` | Per-column bounds on retained distinct/sample values in a profile (defaults `100` / `10`) |
 
 ## License
 

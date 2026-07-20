@@ -154,6 +154,11 @@ class TaskRun(Base):
     events: Mapped[list["TaskRunEvent"]] = relationship(  # noqa: F821
         back_populates="task_run", order_by="TaskRunEvent.created_at"
     )
+    # Module 5: at most one immutable profiling result per run (enforced by
+    # uq_data_profiles_task_run_id at the database layer).
+    data_profile: Mapped["DataProfile | None"] = relationship(  # noqa: F821
+        back_populates="task_run", uselist=False
+    )
 
     def __repr__(self) -> str:
         return f"TaskRun(id={self.id!r}, task={self.task_id!r}, status={self.status!r})"

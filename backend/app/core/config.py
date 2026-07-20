@@ -89,6 +89,26 @@ class Settings(BaseSettings):
         default=15.0, alias="REAPER_POLL_INTERVAL_SECONDS"
     )
 
+    # --- Data ingestion and profiling (Module 5) ---
+    # CSV file paths in DataSource.connection_metadata.file_path are always
+    # resolved relative to this server-controlled root -- never absolute,
+    # never able to escape it (see app.profiling.csv_loader.resolve_source_path).
+    csv_input_root: str = Field(default="./data/csv", alias="CSV_INPUT_ROOT")
+    csv_max_file_size_bytes: int = Field(
+        default=25 * 1024 * 1024, alias="CSV_MAX_FILE_SIZE_BYTES", gt=0
+    )
+    csv_max_rows: int = Field(default=100_000, alias="CSV_MAX_ROWS", gt=0)
+    csv_max_columns: int = Field(default=500, alias="CSV_MAX_COLUMNS", gt=0)
+    csv_max_cell_length: int = Field(
+        default=100_000, alias="CSV_MAX_CELL_LENGTH", gt=0
+    )
+    csv_max_distinct_values: int = Field(
+        default=100, alias="CSV_MAX_DISTINCT_VALUES", gt=0
+    )
+    csv_max_sample_values: int = Field(
+        default=10, alias="CSV_MAX_SAMPLE_VALUES", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

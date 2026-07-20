@@ -16,11 +16,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import PaginationParams, get_current_active_user
 from app.db.session import get_db
+from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
 from app.models.task import Task
 from app.models.task_run import TaskRun
 from app.models.task_run_event import TaskRunEvent
 from app.models.user import User
+from app.schemas.data_profile import DataProfileRead
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 from app.schemas.task_run import TaskRunRead
@@ -274,6 +276,41 @@ def get_task_run(
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
     return run
+
+
+@router.get("/{task_id}/runs/{run_id}/profile", response_model=DataProfileRead)
+def get_task_run_profile(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> DataProfile:
+    """Module 5: the immutable CSV profiling result for one TaskRun, if the
+    execution engine has produced one. 404 if the run itself isn't visible
+    to this org, or if no profile exists yet (e.g. the run hasn't completed,
+    or wasn't a CSV_UPLOAD sync) -- same inactive/cross-org/not-found
+    uniformity as every other endpoint in this router."""
+    task = _get_active_task_or_404(db, task_id, current_user.organization_id)
+    run_exists = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+    if run_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    profile = db.execute(
+        select(DataProfile).where(
+            DataProfile.task_run_id == run_id,
+            DataProfile.task_id == task.id,
+            DataProfile.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Data profile not found")
+    return profile
 
 
 @router.get("/{task_id}/runs/{run_id}/events", response_model=PaginatedResponse[TaskRunEventRead])
