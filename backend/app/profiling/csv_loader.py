@@ -1,4 +1,5 @@
 """Safe, bounded and strictly read-only CSV loading."""
+import codecs
 import csv
 import hashlib
 import io
@@ -29,12 +30,11 @@ def resolve_source_path(input_root: Path, configured_path: str) -> Path:
 
 
 def _decode(raw: bytes) -> tuple[str, str]:
-    for encoding in ("utf-8-sig", "utf-8"):
-        try:
-            return raw.decode(encoding), encoding
-        except UnicodeDecodeError:
-            continue
-    raise CsvLoadError("CSV source is not valid UTF-8")
+    encoding = "utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        return raw.decode(encoding), encoding
+    except UnicodeDecodeError as exc:
+        raise CsvLoadError("CSV source is not valid UTF-8") from exc
 
 
 def load_csv(path: Path, limits: CsvLimits) -> LoadedCsv:
@@ -75,7 +75,11 @@ def load_csv(path: Path, limits: CsvLimits) -> LoadedCsv:
         key = header.casefold()
         if key in seen:
             issues.append(
-                {"type": "duplicate_header", "column_index": index, "first_column_index": seen[key]}
+                {
+                    "type": "duplicate_header",
+                    "column_index": index,
+                    "first_column_index": seen[key],
+                }
             )
         else:
             seen[key] = index
@@ -87,18 +91,27 @@ def load_csv(path: Path, limits: CsvLimits) -> LoadedCsv:
                 raise CsvLoadError("CSV exceeds the configured row limit")
             if len(row) < len(headers):
                 issues.append(
-                    {"type": "too_few_fields", "row_number": row_number, "field_count": len(row)}
+                    {
+                        "type": "too_few_fields",
+                        "row_number": row_number,
+                        "field_count": len(row),
+                    }
                 )
                 row = row + [""] * (len(headers) - len(row))
             elif len(row) > len(headers):
                 issues.append(
-                    {"type": "too_many_fields", "row_number": row_number, "field_count": len(row)}
+                    {
+                        "type": "too_many_fields",
+                        "row_number": row_number,
+                        "field_count": len(row),
+                    }
                 )
                 row = row[: len(headers)]
             for column_index, value in enumerate(row):
                 if len(value) > limits.max_cell_length:
                     raise CsvLoadError(
-                        f"CSV cell exceeds the configured length limit at row {row_number}, column {column_index + 1}"
+                        "CSV cell exceeds the configured length limit at "
+                        f"row {row_number}, column {column_index + 1}"
                     )
             rows.append(row)
     except csv.Error as exc:
