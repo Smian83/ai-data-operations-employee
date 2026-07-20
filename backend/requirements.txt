@@ -25,3 +25,7 @@ python-json-logger==3.2.1
 bcrypt==5.0.0
 pyjwt==2.13.0
 email-validator==2.3.0
+
+# Execution engine (Module 4)
+cryptography==44.0.0
+prometheus-client==0.21.1

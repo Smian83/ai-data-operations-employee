@@ -18,7 +18,9 @@ from app.db.session import get_db
 from app.models.data_source import DataSource
 from app.models.user import User
 from app.schemas.data_source import DataSourceCreate, DataSourceRead, DataSourceUpdate
+from app.schemas.data_source_credential import DataSourceCredentialSet
 from app.schemas.pagination import PaginatedResponse
+from app.worker.credentials import DatabaseCredentialProvider
 
 router = APIRouter(prefix="/data-sources", tags=["data-sources"])
 
@@ -158,4 +160,24 @@ def delete_data_source(
 ) -> None:
     data_source = _get_active_or_404(db, data_source_id, current_user.organization_id)
     data_source.is_active = False
+    db.commit()
+
+
+# --- Module 4: credentials (write-only) -------------------------------------
+
+
+@router.put("/{data_source_id}/credentials", status_code=status.HTTP_204_NO_CONTENT)
+def set_data_source_credentials(
+    data_source_id: uuid.UUID,
+    payload: DataSourceCredentialSet,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> None:
+    """Encrypt and store live credentials for a DataSource. Write-only: there
+    is no corresponding GET anywhere in the API. Only an active, same-org
+    DataSource may have credentials set on it -- inactive/cross-org both
+    404, same as every other direct access in this router."""
+    data_source = _get_active_or_404(db, data_source_id, current_user.organization_id)
+    provider = DatabaseCredentialProvider(db)
+    provider.set_credentials(current_user.organization_id, data_source.id, payload.credentials)
     db.commit()

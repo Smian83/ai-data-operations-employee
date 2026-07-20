@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from app.api.auth import router as auth_router
 from app.api.data_sources import router as data_sources_router
 from app.api.health import router as health_router
+from app.api.internal import router as internal_router
 from app.api.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
@@ -46,6 +47,7 @@ def create_app() -> FastAPI:
     app.include_router(auth_router)
     app.include_router(data_sources_router)
     app.include_router(tasks_router)
+    app.include_router(internal_router)
 
     return app
 

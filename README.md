@@ -37,15 +37,23 @@ ai-data-operations-employee/
 │   │   ├── api/
 │   │   │   ├── health.py         # GET /health
 │   │   │   ├── auth.py           # /auth/register, /login, /me
-│   │   │   ├── deps.py           # get_current_active_user, pagination
-│   │   │   ├── data_sources.py   # /data-sources CRUD
-│   │   │   └── tasks.py          # /tasks CRUD + /tasks/{id}/runs
+│   │   │   ├── deps.py           # get_current_active_user, pagination, superuser gate
+│   │   │   ├── data_sources.py   # /data-sources CRUD + credentials (write-only)
+│   │   │   ├── tasks.py          # /tasks CRUD + /tasks/{id}/runs + run events
+│   │   │   └── internal.py       # /internal/metrics (Module 4, superuser-only)
 │   │   ├── db/
 │   │   │   ├── base.py           # Declarative base
 │   │   │   └── session.py        # Engine / session factory
 │   │   ├── models/                # organization, user, data_source, task,
-│   │   │                          # task_run, enums
-│   │   └── schemas/               # Pydantic request/response schemas
+│   │   │                          # task_run, task_run_event, data_source_credential, enums
+│   │   ├── schemas/               # Pydantic request/response schemas
+│   │   └── worker/                # Module 4: task execution engine
+│   │       ├── engine.py          # claim/heartbeat/complete (lease_token fencing)
+│   │       ├── reaper.py          # stuck-run recovery (expired leases)
+│   │       ├── credentials.py     # CredentialProvider abstraction
+│   │       ├── metrics.py         # Prometheus counters/gauges/histogram
+│   │       ├── runner.py          # worker process main loop
+│   │       └── handlers/          # ExecutionHandler registry + no-op handler
 │   ├── requirements.txt          # Production dependencies (pinned)
 │   └── requirements-dev.txt      # + testing dependencies
 ├── frontend/                     # Reserved for a future module
@@ -53,7 +61,8 @@ ai-data-operations-employee/
 │   ├── alembic.ini
 │   └── alembic/
 │       ├── env.py
-│       └── versions/              # organizations+users, data_sources+tasks+task_runs
+│       └── versions/              # organizations+users, data_sources+tasks+task_runs,
+│       │                          # task execution engine (Module 4)
 ├── docker/
 │   ├── Dockerfile                # Multi-stage production image
 │   └── .dockerignore
@@ -64,7 +73,13 @@ ai-data-operations-employee/
 │   ├── test_health.py
 │   ├── test_auth.py
 │   ├── test_data_sources.py
-│   └── test_tasks.py
+│   ├── test_tasks.py
+│   ├── test_worker_engine.py
+│   ├── test_worker_reaper.py
+│   ├── test_worker_credentials.py
+│   ├── test_worker_handlers.py
+│   ├── test_worker_metrics.py
+│   └── test_worker_api.py
 ├── scripts/
 │   └── wait_for_postgres.py      # Startup dependency check
 ├── pytest.ini
@@ -297,8 +312,8 @@ Returns the current user. `401` with no/invalid token, `403` if inactive.
 
 Core domain model: each organization can register **Data Sources** (systems
 the AI agent will operate on) and define **Tasks** against them. This module
-only models and CRUDs these — actually executing a task is future work
-(Module 4). All endpoints require a Bearer token (see Authentication above)
+only models and CRUDs these — actually executing a task is the Module 4
+Task Execution Engine below. All endpoints require a Bearer token (see Authentication above)
 and are strictly scoped to the caller's organization.
 
 ### Data Sources
@@ -345,10 +360,98 @@ Same CRUD/pagination/soft-delete/case-insensitive-naming rules as Data Sources.
 ### Task Runs
 
 `POST /tasks/{id}/runs` creates a run record in `pending` status — this is an
-enqueue stub, not execution (Module 4 territory). `GET /tasks/{id}/runs`
-(paginated) and `GET /tasks/{id}/runs/{run_id}` read run history. A run's
-`organization_id`, `task_id`, and `triggered_by` are always server-derived,
-never accepted from the client.
+enqueue stub; the Module 4 worker process picks it up and executes it. `GET
+/tasks/{id}/runs` (paginated) and `GET /tasks/{id}/runs/{run_id}` read run
+history. A run's `organization_id`, `task_id`, and `triggered_by` are always
+server-derived, never accepted from the client. There is no PATCH/PUT for a
+run's `status` anywhere in the API — status only ever changes via the
+execution engine (see below).
+
+## Task Execution Engine (Module 4)
+
+A separate worker process (`python -m app.worker`, its own `worker` service
+in `docker-compose.yml`) claims `pending` TaskRuns and executes them. It runs
+independently of the API process — a worker crash or restart never affects
+API availability.
+
+**Claiming.** Workers claim work with `SELECT ... FOR UPDATE SKIP LOCKED`
+(PostgreSQL-only — concurrent workers polling simultaneously never see a row
+another transaction already locked, so two workers can never claim the same
+run) inside a short, atomic transaction that also sets the run to `running`.
+On SQLite (sandbox only) this degenerates to a plain `SELECT`; true claim-
+concurrency safety can only be verified against real PostgreSQL.
+
+**Lease tokens.** Every claim generates a fresh `lease_token` (a UUID, not a
+stable worker identity). Heartbeats and completion calls must present the
+*current* `lease_token` and `status='running'`, or they fail with no effect.
+This is a fencing mechanism: if a worker's lease expires and the row is
+reclaimed (by the reaper or another worker), that row now has a different
+`lease_token`, so the original worker's late heartbeat or result can never
+corrupt state it no longer owns. Enforced additionally at the database level
+by the `ck_task_runs_lease_consistency` CHECK constraint (`running` rows
+must always carry both `lease_token` and `lease_expires_at`; every other
+status must carry neither).
+
+**Idempotency.** Every TaskRun gets an `idempotency_key` (a UUID) generated
+once at creation and never changed, including across retries of the same
+row. Handlers must pass this value to any downstream system whose write they
+perform, so a duplicate execution (e.g. a retry after a crash) cannot create
+a duplicate downstream effect. It is exposed read-only on `TaskRunRead`.
+
+**Retries.** On a retryable failure with attempts remaining, a run is
+requeued to `pending` with `started_at`/`finished_at`/`error_message` reset
+to `NULL` — Module 3's original CHECK constraints needed no changes at all.
+`attempt_count` and `next_retry_at` (exponential backoff, capped) persist
+across the requeue. `max_attempts` and `timeout_seconds` are configurable
+per-`Task` (`null` = use the worker's global default) via the `Task` API.
+
+**Timeouts and stuck-run recovery.** A worker heartbeats a claimed run every
+`WORKER_HEARTBEAT_INTERVAL_SECONDS`, extending `lease_expires_at`. A
+separate reaper loop recovers any `running` row whose lease expired without
+a heartbeat (worker crash, lost connectivity) — reclaiming it exactly as a
+worker-reported failure would (requeue if attempts remain, else terminate).
+
+**Audit trail.** Every transition (claimed, heartbeat-driven requeue,
+succeeded, failed, reaped) is appended to `task_run_events` — append-only,
+never updated or deleted, with full untruncated error detail even after the
+mutable `TaskRun` row has moved past that attempt. Read via `GET
+/tasks/{id}/runs/{run_id}/events` (paginated).
+
+**Credentials.** `DataSource.connection_metadata` still holds non-secret
+parameters only (Module 3's rule, unchanged). Live credentials are set via
+`PUT /data-sources/{id}/credentials` (write-only — no corresponding GET
+anywhere) and stored encrypted (Fernet) in a dedicated
+`data_source_credentials` table. Workers and handlers never talk to that
+table directly — they depend only on the `CredentialProvider` interface
+(`get_credentials(data_source) -> dict`, see `app/worker/credentials.py`).
+The current implementation (`DatabaseCredentialProvider`) is explicitly an
+MVP; migrating to a managed secrets service (Vault, AWS/GCP Secrets Manager)
+means writing a new provider and swapping it in `app/worker/runner.py` — no
+change to engine or handler code. Set `CREDENTIAL_ENCRYPTION_KEY` in
+production (generate with
+`python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`);
+the app refuses to store/read credentials without it when `APP_ENV=production`.
+
+**Task types.** `sync`/`transform`/`export`/`other` (unchanged from Module
+3) all currently map to a single diagnostic `NoOpHandler` — real connector
+logic per task type is a scoped follow-up module. Adding one means writing a
+new handler and registering it in `app/worker/handlers/__init__.py`; nothing
+in the engine changes.
+
+**Metrics.** `GET /internal/metrics` (superuser-only) exposes Prometheus-
+format counters: `task_engine_tasks_claimed_total`,
+`task_engine_tasks_completed_total`, `task_engine_tasks_failed_total`,
+`task_engine_tasks_retried_total`, `task_engine_execution_duration_seconds`
+(histogram), `task_engine_queue_depth` (gauge, pending-run count).
+
+**Known limitations.** `FOR UPDATE SKIP LOCKED` concurrency safety is
+PostgreSQL-only and cannot be verified against the SQLite sandbox — treat
+sandbox test results for claim-atomicity as indicative, not conclusive.
+Application-layer Fernet encryption for credentials is weaker than a
+dedicated secrets manager for key rotation/access auditing; that migration
+is a recommended follow-up, not part of this module. There is no scheduler
+yet — the unused `schedule` column on `Task` stays unused until a future
+cron-driven module; runs are only created via `POST /tasks/{id}/runs`.
 
 ## Health Endpoint
 
@@ -373,6 +476,15 @@ See `.env.example` for the full list. Key variables:
 | `SECRET_KEY`    | Application secret. Used to sign JWTs (Module 2) — generate a real 32+ byte random value before production, never commit it |
 | `JWT_ALGORITHM` | JWT signing algorithm (default `HS256`)          |
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | Access token lifetime in minutes (default `60`) |
+| `CREDENTIAL_ENCRYPTION_KEY` | Fernet key encrypting `DataSourceCredential` rows (Module 4). Required in production |
+| `WORKER_ID` | Base identifier for this worker process (default `worker-1`) |
+| `WORKER_CLAIM_BATCH_SIZE` | Max TaskRuns claimed per poll (default `5`) |
+| `WORKER_POLL_INTERVAL_SECONDS` | Sleep between polls when nothing was claimed (default `5`) |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | Heartbeat frequency while executing (default `30`) |
+| `WORKER_DEFAULT_TIMEOUT_SECONDS` | Default per-run execution timeout (default `300`) |
+| `WORKER_DEFAULT_MAX_ATTEMPTS` | Default max retry attempts (default `3`) |
+| `WORKER_RETRY_BASE_DELAY_SECONDS` / `WORKER_RETRY_MAX_DELAY_SECONDS` | Exponential backoff base/cap (default `30` / `900`) |
+| `REAPER_POLL_INTERVAL_SECONDS` | How often the reaper scans for expired leases (default `15`) |
 
 ## License
 

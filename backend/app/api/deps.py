@@ -77,6 +77,20 @@ def get_current_active_user(current_user: User = Depends(get_current_user)) -> U
     return current_user
 
 
+def get_current_superuser(current_user: User = Depends(get_current_active_user)) -> User:
+    """Module 4: gates operational endpoints (metrics) that expose
+    cross-tenant, org-agnostic system state -- not appropriate for every
+    authenticated user, only an organization's admin (is_superuser is set
+    True on the first user of a new org at registration -- see
+    app.api.auth.register)."""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superuser privileges required",
+        )
+    return current_user
+
+
 # --- Module 3: shared pagination -------------------------------------------
 class PaginationParams:
     """limit/offset pagination shared by every Module 3 list endpoint.

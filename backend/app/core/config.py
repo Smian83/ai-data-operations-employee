@@ -56,6 +56,39 @@ class Settings(BaseSettings):
         default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES"
     )
 
+    # --- Worker / execution engine (Module 4) ---
+    # Fernet key (32 url-safe base64-encoded bytes) used to encrypt
+    # DataSourceCredential rows at the application layer. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # There is no insecure default in production: DatabaseCredentialProvider
+    # refuses to start if this is unset and APP_ENV=production.
+    credential_encryption_key: str | None = Field(
+        default=None, alias="CREDENTIAL_ENCRYPTION_KEY"
+    )
+    worker_id: str = Field(default="worker-1", alias="WORKER_ID")
+    worker_claim_batch_size: int = Field(default=5, alias="WORKER_CLAIM_BATCH_SIZE")
+    worker_poll_interval_seconds: float = Field(
+        default=5.0, alias="WORKER_POLL_INTERVAL_SECONDS"
+    )
+    worker_heartbeat_interval_seconds: float = Field(
+        default=30.0, alias="WORKER_HEARTBEAT_INTERVAL_SECONDS"
+    )
+    worker_default_timeout_seconds: int = Field(
+        default=300, alias="WORKER_DEFAULT_TIMEOUT_SECONDS"
+    )
+    worker_default_max_attempts: int = Field(
+        default=3, alias="WORKER_DEFAULT_MAX_ATTEMPTS"
+    )
+    worker_retry_base_delay_seconds: int = Field(
+        default=30, alias="WORKER_RETRY_BASE_DELAY_SECONDS"
+    )
+    worker_retry_max_delay_seconds: int = Field(
+        default=900, alias="WORKER_RETRY_MAX_DELAY_SECONDS"
+    )
+    reaper_poll_interval_seconds: float = Field(
+        default=15.0, alias="REAPER_POLL_INTERVAL_SECONDS"
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

@@ -1,9 +1,30 @@
 """
-TaskRun: one execution record of a Task. Module 3 creates these only in the
-'pending' state (an enqueue stub) — actually transitioning a run through
-running -> success/failed is Module 4's execution engine. The CHECK
-constraints below exist so the schema is correct *now*, since Module 4 will
-likely write these rows directly (not necessarily through this API).
+TaskRun: one execution record of a Task.
+
+Module 3 created these only in the 'pending' state (an enqueue stub). Module 4
+adds the execution-bookkeeping columns needed for a safe, concurrent worker
+pool to actually run them:
+
+- lease_token: a fresh UUID generated on every claim (not a stable
+  worker id). Heartbeats and completion must present the *current*
+  lease_token, so a worker whose lease already expired and was reclaimed by
+  someone else can never complete a run it no longer owns -- even if it
+  wakes up and finishes the work late. This is a fencing token, not just an
+  ownership label.
+- lease_expires_at / last_heartbeat_at: the timeout/liveness mechanism the
+  reaper uses to detect and recover stuck runs.
+- attempt_count / next_retry_at: retry bookkeeping. A retry resets
+  started_at/finished_at/error_message back to NULL (status returns to
+  'pending'), so Module 3's existing CHECK constraints below needed NO
+  changes at all -- only new, independently-nullable columns were added.
+- idempotency_key: generated once, at row creation, and never changed again
+  (including across retries of the same row). Handlers must pass this value
+  to any downstream system whose write they perform, so that a duplicate
+  execution of the same TaskRun (e.g. a retry after a handler crashed after
+  its side effect but before reporting success) cannot create a duplicate
+  downstream effect. It intentionally is NOT the same as `id`: `id` is a
+  row identity, `idempotency_key` is an execution identity contract handed
+  to external systems.
 """
 import uuid
 from datetime import datetime
@@ -13,7 +34,9 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Integer,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -56,6 +79,21 @@ class TaskRun(Base):
             "finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at",
             name="ck_task_runs_finished_after_started",
         ),
+        # Module 4: a running/claimed row must always carry a lease_token and
+        # a lease_expires_at (both set together on claim, both cleared
+        # together on any terminal/requeue transition). Prevents a
+        # half-claimed row (token without expiry, or vice versa) from ever
+        # being persisted.
+        CheckConstraint(
+            "(status = 'running' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)"
+            " OR (status != 'running' AND lease_token IS NULL AND lease_expires_at IS NULL)",
+            name="ck_task_runs_lease_consistency",
+        ),
+        # Required so TaskRunEvent can have a tenant-aware composite FK
+        # (organization_id, task_run_id) -> (organization_id, id), same
+        # pattern as every other Module 3/4 parent table.
+        UniqueConstraint("organization_id", "id", name="uq_task_runs_org_id"),
+        UniqueConstraint("idempotency_key", name="uq_task_runs_idempotency_key"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
@@ -84,7 +122,26 @@ class TaskRun(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
+    # --- Module 4: execution engine bookkeeping (all additive/nullable) ---
+    idempotency_key: Mapped[uuid.UUID] = mapped_column(
+        Uuid(), nullable=False, default=uuid.uuid4
+    )
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(Uuid(), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(Integer(), nullable=False, default=0)
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     task: Mapped["Task"] = relationship(back_populates="runs")  # noqa: F821
+    events: Mapped[list["TaskRunEvent"]] = relationship(  # noqa: F821
+        back_populates="task_run", order_by="TaskRunEvent.created_at"
+    )
 
     def __repr__(self) -> str:
         return f"TaskRun(id={self.id!r}, task={self.task_id!r}, status={self.status!r})"

@@ -37,6 +37,23 @@ services:
     networks:
       - aidataops_net
 
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: aidataops_worker
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aidataops}:${POSTGRES_PASSWORD:-changeme_dev_password}@db:5432/${POSTGRES_DB:-aidataops}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - aidataops_net
+
 volumes:
   postgres_data:
 

@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKeyConstraint,
     Index,
+    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -72,6 +73,12 @@ class Task(Base):
     description: Mapped[str | None] = mapped_column(Text(), nullable=True)
     task_type: Mapped[TaskType] = mapped_column(task_type_enum, nullable=False)
     schedule: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # --- Module 4: execution engine defaults (additive, nullable) ---
+    # NULL means "use the worker's global default" (see app.core.config),
+    # not "zero/unlimited" -- an explicit override is only ever a real
+    # positive integer, validated at the schema layer.
+    max_attempts: Mapped[int | None] = mapped_column(Integer(), nullable=True)
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer(), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(), ForeignKey("users.id", ondelete="SET NULL"), nullable=True

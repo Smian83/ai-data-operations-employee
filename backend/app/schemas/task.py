@@ -16,6 +16,10 @@ class TaskCreate(BaseModel):
     description: str | None = None
     task_type: TaskType
     schedule: str | None = Field(default=None, max_length=100)
+    # Module 4: per-task execution engine overrides. None means "use the
+    # worker's global default" -- never zero/unlimited.
+    max_attempts: int | None = Field(default=None, ge=1, le=20)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
 
     @field_validator("name")
     @classmethod
@@ -34,6 +38,8 @@ class TaskUpdate(BaseModel):
     description: str | None = None
     task_type: TaskType | None = None
     schedule: str | None = Field(default=None, max_length=100)
+    max_attempts: int | None = Field(default=None, ge=1, le=20)
+    timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
 
     @field_validator("name")
     @classmethod
@@ -56,6 +62,8 @@ class TaskRead(BaseModel):
     description: str | None
     task_type: TaskType
     schedule: str | None
+    max_attempts: int | None
+    timeout_seconds: int | None
     is_active: bool
     created_by: uuid.UUID | None
     created_at: datetime

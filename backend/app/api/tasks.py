@@ -19,10 +19,12 @@ from app.db.session import get_db
 from app.models.data_source import DataSource
 from app.models.task import Task
 from app.models.task_run import TaskRun
+from app.models.task_run_event import TaskRunEvent
 from app.models.user import User
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 from app.schemas.task_run import TaskRunRead
+from app.schemas.task_run_event import TaskRunEventRead
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -94,6 +96,8 @@ def create_task(
         description=payload.description,
         task_type=payload.task_type,
         schedule=payload.schedule,
+        max_attempts=payload.max_attempts,
+        timeout_seconds=payload.timeout_seconds,
         created_by=current_user.id,
     )
     db.add(task)
@@ -169,6 +173,10 @@ def update_task(
         task.task_type = payload.task_type
     if "schedule" in payload.model_fields_set:
         task.schedule = payload.schedule
+    if "max_attempts" in payload.model_fields_set:
+        task.max_attempts = payload.max_attempts
+    if "timeout_seconds" in payload.model_fields_set:
+        task.timeout_seconds = payload.timeout_seconds
 
     try:
         db.commit()
@@ -266,3 +274,43 @@ def get_task_run(
     if run is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
     return run
+
+
+@router.get("/{task_id}/runs/{run_id}/events", response_model=PaginatedResponse[TaskRunEventRead])
+def list_task_run_events(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[TaskRunEventRead]:
+    """Read-only Module 4 audit trail for a single TaskRun: every claim,
+    heartbeat-driven requeue, success, failure, and reaper recovery, in
+    order. Never writable via the API -- only the execution engine appends
+    to this table."""
+    run = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task_id,
+            TaskRun.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+    if run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    filters = [
+        TaskRunEvent.task_run_id == run_id,
+        TaskRunEvent.organization_id == current_user.organization_id,
+    ]
+    total = db.execute(select(func.count()).select_from(TaskRunEvent).where(*filters)).scalar_one()
+    rows = db.execute(
+        select(TaskRunEvent)
+        .where(*filters)
+        .order_by(TaskRunEvent.created_at)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
