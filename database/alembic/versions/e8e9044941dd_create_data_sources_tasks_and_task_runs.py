@@ -16,6 +16,59 @@ down_revision: Union[str, None] = "b3e2e4e74b4b"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
+
+def _create_enum_idempotent(bind, enum_type: sa.Enum) -> None:
+    """Create a native PostgreSQL enum type without raising if it already
+    exists.
+
+    sa.Enum.create(bind, checkfirst=True) is *supposed* to guarantee this,
+    but its existence check queries the database at the moment this
+    function runs -- it says nothing about whether alembic_version
+    correctly reflects that state. If this migration's upgrade() is ever
+    re-entered against a database that already has these types (e.g.
+    alembic_version was reset, restored from an older snapshot, or points
+    at an earlier revision than the database's actual objects reflect --
+    exactly what happened during Module 4's real-PostgreSQL verification),
+    checkfirst=True does not help, because from Alembic's point of view
+    this migration has "not run yet" and it dutifully re-executes upgrade()
+    from the top.
+
+    A PostgreSQL-native guarded DDL block (CREATE TYPE wrapped in a DO
+    block that swallows duplicate_object) sidesteps that entirely: it is
+    safe to execute unconditionally, regardless of what alembic_version
+    claims. On non-PostgreSQL dialects (the SQLite sandbox), native enum
+    types do not exist at all -- create_constraint=True on the model
+    already expresses "enum-ness" as a per-column CHECK constraint instead,
+    so Enum.create() there is already a safe no-op and needs no change.
+    """
+    if bind.dialect.name != "postgresql":
+        enum_type.create(bind, checkfirst=True)
+        return
+    values_sql = ", ".join(f"'{value}'" for value in enum_type.enums)
+    bind.execute(
+        sa.text(
+            f"""
+            DO $$
+            BEGIN
+                CREATE TYPE {enum_type.name} AS ENUM ({values_sql});
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END
+            $$;
+            """
+        )
+    )
+
+
+def _drop_enum_idempotent(bind, enum_type: sa.Enum) -> None:
+    """Symmetric counterpart to _create_enum_idempotent -- DROP TYPE IF
+    EXISTS is unconditionally safe to re-run on PostgreSQL, regardless of
+    alembic_version state."""
+    if bind.dialect.name != "postgresql":
+        enum_type.drop(bind, checkfirst=True)
+        return
+    bind.execute(sa.text(f"DROP TYPE IF EXISTS {enum_type.name}"))
+
 # create_type=False: we create/drop these explicitly in upgrade()/downgrade()
 # rather than letting create_table() auto-manage them, which is the
 # recommended pattern for enums shared across upgrade/downgrade cycles.
@@ -38,9 +91,9 @@ task_run_status_enum = sa.Enum(
 
 def upgrade() -> None:
     bind = op.get_bind()
-    source_type_enum.create(bind, checkfirst=True)
-    task_type_enum.create(bind, checkfirst=True)
-    task_run_status_enum.create(bind, checkfirst=True)
+    _create_enum_idempotent(bind, source_type_enum)
+    _create_enum_idempotent(bind, task_type_enum)
+    _create_enum_idempotent(bind, task_run_status_enum)
 
     # --- data_sources ---------------------------------------------------
     op.create_table(
@@ -209,6 +262,6 @@ def downgrade() -> None:
     op.drop_table("data_sources")
 
     bind = op.get_bind()
-    task_run_status_enum.drop(bind, checkfirst=True)
-    task_type_enum.drop(bind, checkfirst=True)
-    source_type_enum.drop(bind, checkfirst=True)
+    _drop_enum_idempotent(bind, task_run_status_enum)
+    _drop_enum_idempotent(bind, task_type_enum)
+    _drop_enum_idempotent(bind, source_type_enum)
