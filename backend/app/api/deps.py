@@ -8,7 +8,7 @@ import logging
 import uuid
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Query, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 
@@ -75,3 +75,17 @@ def get_current_active_user(current_user: User = Depends(get_current_user)) -> U
             detail="Inactive user",
         )
     return current_user
+
+
+# --- Module 3: shared pagination -------------------------------------------
+class PaginationParams:
+    """limit/offset pagination shared by every Module 3 list endpoint.
+    default limit=50, hard max limit=100 (422 if exceeded, never clamped)."""
+
+    def __init__(
+        self,
+        limit: int = Query(default=50, ge=1, le=100),
+        offset: int = Query(default=0, ge=0),
+    ) -> None:
+        self.limit = limit
+        self.offset = offset

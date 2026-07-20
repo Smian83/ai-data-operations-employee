@@ -1,0 +1,214 @@
+"""create data sources tasks and task runs
+
+Revision ID: e8e9044941dd
+Revises: b3e2e4e74b4b
+Create Date: 2026-07-20 10:00:00.000000
+
+"""
+from typing import Sequence, Union
+
+import sqlalchemy as sa
+from alembic import op
+
+# revision identifiers, used by Alembic.
+revision: str = "e8e9044941dd"
+down_revision: Union[str, None] = "b3e2e4e74b4b"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+# create_type=False: we create/drop these explicitly in upgrade()/downgrade()
+# rather than letting create_table() auto-manage them, which is the
+# recommended pattern for enums shared across upgrade/downgrade cycles.
+source_type_enum = sa.Enum(
+    "postgres", "mysql", "rest_api", "csv_upload", "s3", "other",
+    name="source_type_enum",
+    create_type=False,
+)
+task_type_enum = sa.Enum(
+    "sync", "transform", "export", "other",
+    name="task_type_enum",
+    create_type=False,
+)
+task_run_status_enum = sa.Enum(
+    "pending", "running", "success", "failed",
+    name="task_run_status_enum",
+    create_type=False,
+)
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    source_type_enum.create(bind, checkfirst=True)
+    task_type_enum.create(bind, checkfirst=True)
+    task_run_status_enum.create(bind, checkfirst=True)
+
+    # --- data_sources ---------------------------------------------------
+    op.create_table(
+        "data_sources",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("organization_id", sa.Uuid(), nullable=False),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("source_type", source_type_enum, nullable=False),
+        sa.Column("connection_metadata", sa.JSON(), nullable=False),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("created_by", sa.Uuid(), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_data_sources"),
+        # Required so `tasks` can have a tenant-aware composite FK pointing
+        # at (organization_id, id) — see fk_tasks_org_data_source below.
+        sa.UniqueConstraint("organization_id", "id", name="uq_data_sources_org_id"),
+        sa.ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_data_sources_organization_id_organizations", ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["created_by"], ["users.id"],
+            name="fk_data_sources_created_by_users", ondelete="SET NULL",
+        ),
+    )
+    op.create_index("ix_data_sources_organization_id", "data_sources", ["organization_id"])
+    # Case-insensitive, whitespace-trimmed uniqueness among ACTIVE rows only
+    # — soft-deleting a data source frees its name for reuse.
+    op.create_index(
+        "ix_data_sources_org_name_active",
+        "data_sources",
+        ["organization_id", sa.text("lower(trim(name))")],
+        unique=True,
+        postgresql_where=sa.text("is_active = true"),
+        sqlite_where=sa.text("is_active = 1"),
+    )
+
+    # --- tasks ------------------------------------------------------------
+    op.create_table(
+        "tasks",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        sa.Column("organization_id", sa.Uuid(), nullable=False),
+        sa.Column("data_source_id", sa.Uuid(), nullable=True),
+        sa.Column("name", sa.String(length=255), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("task_type", task_type_enum, nullable=False),
+        sa.Column("schedule", sa.String(length=100), nullable=True),
+        sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.true()),
+        sa.Column("created_by", sa.Uuid(), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.Column(
+            "updated_at", sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_tasks"),
+        sa.UniqueConstraint("organization_id", "id", name="uq_tasks_org_id"),
+        sa.ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_tasks_organization_id_organizations", ondelete="CASCADE",
+        ),
+        # Tenant-aware composite FK: data_source_id, when set, MUST belong
+        # to a DataSource in the SAME organization_id. NULL data_source_id
+        # satisfies the constraint automatically (standard multi-column FK
+        # semantics) — a task with no source is allowed.
+        sa.ForeignKeyConstraint(
+            ["organization_id", "data_source_id"],
+            ["data_sources.organization_id", "data_sources.id"],
+            name="fk_tasks_org_data_source", ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["created_by"], ["users.id"],
+            name="fk_tasks_created_by_users", ondelete="SET NULL",
+        ),
+    )
+    op.create_index("ix_tasks_organization_id", "tasks", ["organization_id"])
+    op.create_index("ix_tasks_data_source_id", "tasks", ["data_source_id"])
+    op.create_index(
+        "ix_tasks_org_name_active",
+        "tasks",
+        ["organization_id", sa.text("lower(trim(name))")],
+        unique=True,
+        postgresql_where=sa.text("is_active = true"),
+        sqlite_where=sa.text("is_active = 1"),
+    )
+
+    # --- task_runs ----------------------------------------------------------
+    op.create_table(
+        "task_runs",
+        sa.Column("id", sa.Uuid(), nullable=False),
+        # Denormalized (also derivable via task_id -> tasks.organization_id)
+        # so tenant-scoped queries on this — the highest-volume table —
+        # never depend on remembering to join through Task, and so the
+        # tenant-aware composite FK below is possible at all.
+        sa.Column("organization_id", sa.Uuid(), nullable=False),
+        sa.Column("task_id", sa.Uuid(), nullable=False),
+        sa.Column(
+            "status", task_run_status_enum, nullable=False,
+            server_default=sa.text("'pending'"),
+        ),
+        sa.Column("triggered_by", sa.Uuid(), nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("log_output", sa.Text(), nullable=True),
+        sa.Column("error_message", sa.Text(), nullable=True),
+        sa.Column(
+            "created_at", sa.DateTime(timezone=True),
+            server_default=sa.func.now(), nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("id", name="pk_task_runs"),
+        sa.ForeignKeyConstraint(
+            ["organization_id"], ["organizations.id"],
+            name="fk_task_runs_organization_id_organizations", ondelete="CASCADE",
+        ),
+        # Tenant-aware composite FK: organization_id must match the
+        # referenced Task's organization_id. Enforced by the database.
+        sa.ForeignKeyConstraint(
+            ["organization_id", "task_id"],
+            ["tasks.organization_id", "tasks.id"],
+            name="fk_task_runs_org_task", ondelete="RESTRICT",
+        ),
+        sa.ForeignKeyConstraint(
+            ["triggered_by"], ["users.id"],
+            name="fk_task_runs_triggered_by_users", ondelete="SET NULL",
+        ),
+        sa.CheckConstraint(
+            "(status = 'pending' AND started_at IS NULL AND finished_at IS NULL"
+            "  AND error_message IS NULL)"
+            " OR (status = 'running' AND started_at IS NOT NULL AND finished_at IS NULL)"
+            " OR (status = 'success' AND started_at IS NOT NULL AND finished_at IS NOT NULL"
+            "     AND error_message IS NULL)"
+            " OR (status = 'failed' AND started_at IS NOT NULL AND finished_at IS NOT NULL"
+            "     AND error_message IS NOT NULL)",
+            name="ck_task_runs_status_invariants",
+        ),
+        sa.CheckConstraint(
+            "finished_at IS NULL OR started_at IS NULL OR finished_at >= started_at",
+            name="ck_task_runs_finished_after_started",
+        ),
+    )
+    op.create_index("ix_task_runs_organization_id", "task_runs", ["organization_id"])
+    op.create_index("ix_task_runs_task_id", "task_runs", ["task_id"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_task_runs_task_id", table_name="task_runs")
+    op.drop_index("ix_task_runs_organization_id", table_name="task_runs")
+    op.drop_table("task_runs")
+
+    op.drop_index("ix_tasks_org_name_active", table_name="tasks")
+    op.drop_index("ix_tasks_data_source_id", table_name="tasks")
+    op.drop_index("ix_tasks_organization_id", table_name="tasks")
+    op.drop_table("tasks")
+
+    op.drop_index("ix_data_sources_org_name_active", table_name="data_sources")
+    op.drop_index("ix_data_sources_organization_id", table_name="data_sources")
+    op.drop_table("data_sources")
+
+    bind = op.get_bind()
+    task_run_status_enum.drop(bind, checkfirst=True)
+    task_type_enum.drop(bind, checkfirst=True)
+    source_type_enum.drop(bind, checkfirst=True)
