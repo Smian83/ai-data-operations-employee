@@ -16,11 +16,13 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import PaginationParams, get_current_active_user
 from app.db.session import get_db
+from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
 from app.models.task import Task
 from app.models.task_run import TaskRun
 from app.models.task_run_event import TaskRunEvent
 from app.models.user import User
+from app.schemas.data_profile import DataProfileRead
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 from app.schemas.task_run import TaskRunRead
@@ -29,7 +31,12 @@ from app.schemas.task_run_event import TaskRunEventRead
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 
-def _name_taken(db: Session, org_id: uuid.UUID, name: str, exclude_id: uuid.UUID | None = None) -> bool:
+def _name_taken(
+    db: Session,
+    org_id: uuid.UUID,
+    name: str,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
     stmt = select(Task.id).where(
         Task.organization_id == org_id,
         func.lower(func.trim(Task.name)) == name.strip().lower(),
@@ -210,16 +217,12 @@ def create_task_run(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> TaskRun:
-    # Inactive or cross-org task -> 404, same as any other direct access.
     task = _get_active_task_or_404(db, task_id, current_user.organization_id)
 
     run = TaskRun(
         organization_id=current_user.organization_id,
         task_id=task.id,
         triggered_by=current_user.id,
-        # status defaults to PENDING at the model layer; started_at/
-        # finished_at/error_message all remain NULL, satisfying
-        # ck_task_runs_status_invariants for the 'pending' branch.
     )
     db.add(run)
     db.commit()
@@ -234,8 +237,6 @@ def list_task_runs(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> PaginatedResponse[TaskRunRead]:
-    # Confirms the task itself is visible to this org (404 otherwise) before
-    # listing its runs — same inactive/cross-org rules as everything else.
     task = _get_active_task_or_404(db, task_id, current_user.organization_id)
 
     filters = [
@@ -276,6 +277,37 @@ def get_task_run(
     return run
 
 
+@router.get("/{task_id}/runs/{run_id}/profile", response_model=DataProfileRead)
+def get_task_run_profile(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> DataProfile:
+    """Return the immutable Module 5 profile for one visible TaskRun."""
+    task = _get_active_task_or_404(db, task_id, current_user.organization_id)
+    run_exists = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+    if run_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    profile = db.execute(
+        select(DataProfile).where(
+            DataProfile.task_run_id == run_id,
+            DataProfile.task_id == task.id,
+            DataProfile.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+    if profile is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Data profile not found")
+    return profile
+
+
 @router.get("/{task_id}/runs/{run_id}/events", response_model=PaginatedResponse[TaskRunEventRead])
 def list_task_run_events(
     task_id: uuid.UUID,
@@ -284,10 +316,7 @@ def list_task_run_events(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_user),
 ) -> PaginatedResponse[TaskRunEventRead]:
-    """Read-only Module 4 audit trail for a single TaskRun: every claim,
-    heartbeat-driven requeue, success, failure, and reaper recovery, in
-    order. Never writable via the API -- only the execution engine appends
-    to this table."""
+    """Read-only Module 4 audit trail for a single TaskRun."""
     run = db.execute(
         select(TaskRun.id).where(
             TaskRun.id == run_id,
