@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "e8e9044941dd"
@@ -72,17 +73,34 @@ def _drop_enum_idempotent(bind, enum_type: sa.Enum) -> None:
 # create_type=False: we create/drop these explicitly in upgrade()/downgrade()
 # rather than letting create_table() auto-manage them, which is the
 # recommended pattern for enums shared across upgrade/downgrade cycles.
-source_type_enum = sa.Enum(
+# IMPORTANT: these must be sqlalchemy.dialects.postgresql.ENUM, NOT the
+# generic sa.Enum. The generic sa.Enum silently drops an unrecognized
+# create_type kwarg (its __init__ only ever pops native_enum,
+# create_constraint, values_callable, sort_key_function, length,
+# omit_aliases, validate_strings -- never create_type), so create_type=False
+# passed to sa.Enum has *no effect at all*. At CREATE TABLE compile time,
+# SQLAlchemy adapts a generic Enum into a native postgresql.ENUM via
+# ENUM.adapt_emulated_to_native(), which only forwards create_type from the
+# original object when that object was ALREADY a NativeForEmulated type
+# (i.e. already postgresql.ENUM) -- a plain sa.Enum never qualifies, so the
+# adapted object falls back to the constructor default of create_type=True,
+# and op.create_table() below silently emits its own CREATE TYPE regardless
+# of what was passed here. This was the actual root cause of the
+# DuplicateObject failure during Module 4 PostgreSQL verification: the type
+# created by _create_enum_idempotent() below was immediately re-created (and
+# collided) by op.create_table()'s own automatic enum DDL. Only
+# postgresql.ENUM genuinely implements and honors create_type.
+source_type_enum = postgresql.ENUM(
     "postgres", "mysql", "rest_api", "csv_upload", "s3", "other",
     name="source_type_enum",
     create_type=False,
 )
-task_type_enum = sa.Enum(
+task_type_enum = postgresql.ENUM(
     "sync", "transform", "export", "other",
     name="task_type_enum",
     create_type=False,
 )
-task_run_status_enum = sa.Enum(
+task_run_status_enum = postgresql.ENUM(
     "pending", "running", "success", "failed",
     name="task_run_status_enum",
     create_type=False,

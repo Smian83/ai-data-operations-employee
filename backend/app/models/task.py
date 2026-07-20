@@ -19,7 +19,14 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy import Enum as SAEnum
+# NOTE: this must be sqlalchemy.dialects.postgresql.ENUM, NOT the generic
+# sqlalchemy.Enum. The generic Enum silently ignores an unrecognized
+# create_type kwarg (its __init__ never pops it), so create_type=False
+# below would otherwise have no effect and Base.metadata.create_all()
+# would independently emit CREATE TYPE against a live PostgreSQL database
+# -- exactly the DuplicateObject bug hit during Module 4 verification.
+# Only postgresql.ENUM genuinely implements and honors create_type.
+from sqlalchemy.dialects.postgresql import ENUM as SAEnum
 from sqlalchemy import ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
