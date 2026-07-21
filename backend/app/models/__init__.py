@@ -20,3 +20,5 @@ from app.models.match_run import MatchRun  # noqa: F401
 from app.models.match_group import MatchGroup  # noqa: F401
 from app.models.match_decision import MatchDecision  # noqa: F401
 from app.models.match_skipped_block import MatchSkippedBlock  # noqa: F401
+from app.models.export_run import ExportRun  # noqa: F401
+from app.models.export_row_exclusion import ExportRowExclusion  # noqa: F401
