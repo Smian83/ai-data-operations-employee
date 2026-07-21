@@ -14,3 +14,9 @@ from app.models.standardization_run import StandardizationRun  # noqa: F401
 from app.models.standardization_change import StandardizationChange  # noqa: F401
 from app.models.standardization_column_mapping import StandardizationColumnMapping  # noqa: F401
 from app.models.standardization_lookup_entry import StandardizationLookupEntry  # noqa: F401
+from app.models.match_rule_set import MatchRuleSet  # noqa: F401
+from app.models.match_rule_field import MatchRuleField  # noqa: F401
+from app.models.match_run import MatchRun  # noqa: F401
+from app.models.match_group import MatchGroup  # noqa: F401
+from app.models.match_decision import MatchDecision  # noqa: F401
+from app.models.match_skipped_block import MatchSkippedBlock  # noqa: F401

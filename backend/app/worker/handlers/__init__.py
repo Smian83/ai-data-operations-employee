@@ -21,11 +21,20 @@ SYNC, EXPORT, and OTHER are all unaffected), since no existing task_type
 was available to reuse (see docs/module-7-data-standardization-engine-
 design.md Section 2 for why). A Task with task_type=STANDARDIZE requires
 an APPROVED CleaningRun for the TaskRun's source_task_run_id or fails
-permanently (see StandardizationHandler.execute). EXPORT and OTHER remain
-on NoOpHandler until their own follow-up modules."""
+permanently (see StandardizationHandler.execute).
+
+Module 8 update: another NEW TaskType value, MATCH, now maps to
+MatchHandler -- purely additive again (SYNC, TRANSFORM, STANDARDIZE,
+EXPORT, and OTHER are all unaffected). A Task with task_type=MATCH
+requires an APPROVED StandardizationRun for the TaskRun's source_task_
+run_id or fails permanently (see MatchHandler.execute). Unlike every
+handler before it, MatchHandler writes no output file at all -- see
+docs/module-8-data-matching-deduplication-design.md Section 2. EXPORT
+and OTHER remain on NoOpHandler until their own follow-up modules."""
 from app.models.enums import TaskType
 from app.worker.handlers.base import ExecutionHandler
 from app.worker.handlers.cleaning import CleaningHandler
+from app.worker.handlers.matching import MatchHandler
 from app.worker.handlers.csv_profiling import CsvProfilingHandler
 from app.worker.handlers.noop import NoOpHandler
 from app.worker.handlers.standardization import StandardizationHandler
@@ -36,6 +45,7 @@ HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.EXPORT: NoOpHandler(),
     TaskType.OTHER: NoOpHandler(),
     TaskType.STANDARDIZE: StandardizationHandler(),
+    TaskType.MATCH: MatchHandler(),
 }
 
 
