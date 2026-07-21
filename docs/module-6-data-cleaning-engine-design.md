@@ -145,7 +145,7 @@ Approval itself follows a small, fixed state machine: pending review leads to ei
 **One additive column on `task_runs`:** `source_task_run_id`, nullable, self-referential composite FK scoped by organization, `RESTRICT` on delete. Meaningful only for `TRANSFORM` runs; `NULL` for every existing row and every other task type. Zero impact on existing data or existing queries.
 
 **Two new tables:**
-- `cleaning_runs` — one row per cleaning `TaskRun`: identifiers, output file location and hash, summary counts, confidence, post-clean comparison metrics, approval state and who/when for each transition.
+- `cleaning_runs` — one row per cleaning `TaskRun`: identifiers, output file location and hash, summary counts, confidence, post-clean comparison metrics, approval state and who/when for each transition, and `cleaning_engine_version` (initial value `"1.0"`) — records which deterministic cleaning engine version produced each run, so a future rule-set change remains fully traceable and auditable against exactly the engine version that actually produced any given historical run.
 - `cleaning_changes` — many rows per `cleaning_runs` row, capped per Section 14: row/column location, original and cleaned value, rule name, reason, confidence.
 
 `status` on `cleaning_runs` is a plain string, following the exact precedent `TaskRunEvent.event_type` already set in this codebase, not a new native Postgres enum — this avoids the one bug class (enum DDL owned in two places) this project has actually hit twice. `TaskType` is unchanged; `TRANSFORM` is reused, already reserved for this per the handler registry's own existing docstring.
@@ -218,6 +218,7 @@ Direct structural mirror of the existing `profiling/` + `csv_profiling.py` + `da
 - [ ] Tenant isolation proven on every new endpoint and on the handler's file/DB access, to the same standard as the B1/B2 fixes.
 - [ ] Zero changes to any existing API endpoint's contract; zero changes to Modules 1–5 beyond the one additive column and the one registry-entry swap.
 - [ ] Not merged into `main` until reviewed and approved.
+- [ ] The cleaning engine must be deterministic. The same input file with the same rule set must always produce identical: cleaned output, audit records, confidence values.
 
 ---
 

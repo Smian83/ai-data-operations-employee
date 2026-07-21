@@ -8,3 +8,5 @@ from app.models.task_run import TaskRun  # noqa: F401
 from app.models.task_run_event import TaskRunEvent  # noqa: F401
 from app.models.data_source_credential import DataSourceCredential  # noqa: F401
 from app.models.data_profile import DataProfile  # noqa: F401
+from app.models.cleaning_run import CleaningRun  # noqa: F401
+from app.models.cleaning_change import CleaningChange  # noqa: F401

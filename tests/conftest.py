@@ -51,13 +51,52 @@ def _create_tables():
 @pytest.fixture(autouse=True)
 def _clean_tables():
     """Delete all rows from every table before each test so tests are
-    order-independent and repeatable, regardless of backend."""
+    order-independent and repeatable, regardless of backend.
+
+    Module 6 added a self-referential FK (task_runs.source_task_run_id ->
+    task_runs.id, ondelete=RESTRICT). A single bulk DELETE against a table
+    with a RESTRICT self-reference can fail depending on which row SQLite
+    happens to delete first within that statement (the referencing row's
+    delete succeeding is not guaranteed to precede the referenced row's),
+    so self-referencing columns are nulled out first, independent of
+    delete order, before the normal dependency-ordered delete pass runs."""
     from app.db.base import Base
     from app.db.session import SessionLocal
 
     yield
     db = SessionLocal()
     try:
+        for table in Base.metadata.sorted_tables:
+            # A column can appear in a self-referential FK constraint
+            # (referred_table is this table) while ALSO appearing in a
+            # different, non-self FK constraint on the same table -- e.g.
+            # task_runs.organization_id is part of BOTH the self-
+            # referential (organization_id, source_task_run_id) ->
+            # task_runs constraint AND the ordinary organization_id ->
+            # organizations.id constraint. Only columns exclusively used
+            # for self-reference are safe to null out here; nulling a
+            # shared column like organization_id would violate its own
+            # NOT NULL constraint.
+            used_elsewhere: set[str] = set()
+            self_ref_only: set[str] = set()
+            for fkc in table.foreign_key_constraints:
+                names = {c.name for c in fkc.columns}
+                if fkc.referred_table is table:
+                    self_ref_only |= names
+                else:
+                    used_elsewhere |= names
+            nullable_self_ref_columns = [
+                table.c[name]
+                for name in (self_ref_only - used_elsewhere)
+                if table.c[name].nullable
+            ]
+            if nullable_self_ref_columns:
+                db.execute(
+                    table.update().values(
+                        {col.name: None for col in nullable_self_ref_columns}
+                    )
+                )
+        db.commit()
         for table in reversed(Base.metadata.sorted_tables):
             db.execute(table.delete())
         db.commit()

@@ -109,6 +109,21 @@ class Settings(BaseSettings):
         default=10, alias="CSV_MAX_SAMPLE_VALUES", gt=0
     )
 
+    # --- Data cleaning engine (Module 6) ---
+    # Cleaned output CSVs are written under this tenant-scoped root
+    # (CSV_OUTPUT_ROOT/{organization_id}/...), mirroring CSV_INPUT_ROOT's
+    # existing per-tenant isolation exactly -- never the same root as
+    # CSV_INPUT_ROOT, and the original source file is never opened for
+    # writing anywhere in this module (see app.worker.handlers.cleaning).
+    csv_output_root: str = Field(default="./data/csv_cleaned", alias="CSV_OUTPUT_ROOT")
+    # Caps individual CleaningChange rows persisted per run; CleaningRun.
+    # total_changes_count is always the true total even when capped -- same
+    # bounded-but-never-silent pattern as CSV_MAX_DISTINCT_VALUES/
+    # CSV_MAX_SAMPLE_VALUES.
+    cleaning_max_persisted_changes: int = Field(
+        default=10_000, alias="CLEANING_MAX_PERSISTED_CHANGES", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
