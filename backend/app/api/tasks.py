@@ -22,6 +22,8 @@ from app.models.cleaning_run import CleaningRun
 from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
 from app.models.enums import TaskType
+from app.models.export_row_exclusion import ExportRowExclusion
+from app.models.export_run import ExportRun
 from app.models.match_decision import MatchDecision
 from app.models.match_group import MatchGroup
 from app.models.match_rule_field import MatchRuleField
@@ -39,6 +41,8 @@ from app.models.user import User
 from app.schemas.cleaning_change import CleaningChangeRead
 from app.schemas.cleaning_run import CleaningRunRead
 from app.schemas.data_profile import DataProfileRead
+from app.schemas.export_row_exclusion import ExportRowExclusionRead
+from app.schemas.export_run import ExportRunRead
 from app.schemas.match_decision import MatchDecisionRead
 from app.schemas.match_group import MatchGroupRead
 from app.schemas.match_rule_set import MatchRuleSetCreate, MatchRuleSetRead
@@ -247,27 +251,30 @@ def create_task_run(
     """Module 6: payload is optional -- omitted entirely, it behaves exactly
     as before. source_task_run_id is required for TRANSFORM tasks (which
     prior SYNC run's DataProfile to clean), for STANDARDIZE tasks (which
-    prior TRANSFORM run's approved CleaningRun to standardize), and, as of
-    Module 8, for MATCH tasks too (which prior STANDARDIZE run's approved
-    StandardizationRun to match/deduplicate) -- same required/rejected
-    branch extended to a third task_type, still rejected for every other
-    task type, so the field's meaning can never be ambiguous per task.
-    This API-layer check only confirms the referenced run exists in the
-    same org; the deeper "must be an approved StandardizationRun" check
-    for MATCH stays in MatchHandler, exactly as STANDARDIZE's CleaningRun
-    check stays in StandardizationHandler."""
+    prior TRANSFORM run's approved CleaningRun to standardize), for MATCH
+    tasks (which prior STANDARDIZE run's approved StandardizationRun to
+    match/deduplicate), and, as of Module 9, for EXPORT tasks too (which
+    prior MATCH run's approved MatchRun to materialize) -- same
+    required/rejected branch extended to a fourth task_type, still
+    rejected for every other task type, so the field's meaning can never
+    be ambiguous per task. This API-layer check only confirms the
+    referenced run exists in the same org; the deeper "must be an
+    approved MatchRun" check for EXPORT stays in ExportHandler, exactly
+    as MATCH's StandardizationRun check stays in MatchHandler."""
     # Inactive or cross-org task -> 404, same as any other direct access.
     task = _get_active_task_or_404(db, task_id, current_user.organization_id)
 
     source_task_run_id = payload.source_task_run_id if payload is not None else None
 
-    if task.task_type in (TaskType.TRANSFORM, TaskType.STANDARDIZE, TaskType.MATCH):
+    if task.task_type in (
+        TaskType.TRANSFORM, TaskType.STANDARDIZE, TaskType.MATCH, TaskType.EXPORT
+    ):
         if source_task_run_id is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "source_task_run_id is required for TRANSFORM, STANDARDIZE, "
-                    "and MATCH tasks"
+                    "MATCH, and EXPORT tasks"
                 ),
             )
         source_run_exists = db.execute(
@@ -286,7 +293,7 @@ def create_task_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 "source_task_run_id is only valid for TRANSFORM, STANDARDIZE, "
-                "and MATCH tasks"
+                "MATCH, and EXPORT tasks"
             ),
         )
 
@@ -1310,3 +1317,190 @@ def list_match_rule_sets(
     return PaginatedResponse(
         items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
     )
+
+
+# --- Module 9: data export engine ------------------------------------------
+#
+# Consumes an APPROVED MatchRun (Module 8) and materializes it into a
+# real deduplicated output CSV. Endpoint shape is a direct structural
+# mirror of the matching-result endpoints above (_get_match_run_or_404 /
+# get_task_run_matching / approve/reject/rollback), extended with a
+# summary that DOES include output_file_path/output_sha256/file metadata
+# (unlike MatchRunRead) since Export -- unlike Match -- writes a real
+# file. No configuration-CRUD endpoints exist for Module 9: there is no
+# organization-configurable export behavior in this release (see design
+# doc Section 5's non-goals).
+
+
+def _get_export_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> ExportRun:
+    """Shared 404 chain for every export-result endpoint: task visible ->
+    run visible -> export result exists. Direct mirror of
+    _get_match_run_or_404."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    run_exists = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if run_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    export_run = db.execute(
+        select(ExportRun).where(
+            ExportRun.task_run_id == run_id,
+            ExportRun.task_id == task.id,
+            ExportRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if export_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Export result not found"
+        )
+    return export_run
+
+
+@router.get("/{task_id}/runs/{run_id}/export", response_model=ExportRunRead)
+def get_task_run_export(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ExportRun:
+    """Module 9: the summary result of an EXPORT TaskRun -- row counts,
+    the output file's location/hash/size/column-count/schema-version, and
+    current approval status. The exported CSV's column layout is
+    [...original standardized columns in their existing order...,
+    __aiops_canonical_record (boolean), __aiops_source_row_index
+    (integer)] -- both reserved, non-configurable, and guaranteed absent
+    from the *input* header for any run that reached this endpoint (a
+    collision there fails the run permanently before an ExportRun is ever
+    created -- see ExportHandler). export_timestamp is database metadata
+    only and is never present inside the CSV file itself. 404 if the run
+    isn't visible to this org, or no export result exists yet."""
+    return _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/export/exclusions",
+    response_model=PaginatedResponse[ExportRowExclusionRead],
+)
+def list_task_run_export_exclusions(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    match_group_id: uuid.UUID | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[ExportRowExclusionRead]:
+    """Module 9: the bounded audit log of rows excluded from an export --
+    the direct query surface for "why is this row missing from my
+    exported file." ?match_group_id=... shows every row excluded because
+    of one specific Module 8 duplicate group; cross-reference GET
+    .../matching/decisions?match_group_id=... for the deeper "why was
+    this row grouped" question, already answered by Module 8's own audit
+    trail. Note this may under-represent excluded_row_count on ExportRun
+    for a run whose exclusion volume exceeded
+    EXPORT_MAX_PERSISTED_EXCLUSIONS; the aggregate count on the parent
+    ExportRun is always accurate even when the per-row detail rows are
+    capped."""
+    export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+    filters = [
+        ExportRowExclusion.export_run_id == export_run.id,
+        ExportRowExclusion.organization_id == current_user.organization_id,
+    ]
+    if match_group_id is not None:
+        filters.append(ExportRowExclusion.match_group_id == match_group_id)
+
+    total = db.execute(
+        select(func.count()).select_from(ExportRowExclusion).where(*filters)
+    ).scalar_one()
+    rows = db.execute(
+        select(ExportRowExclusion)
+        .where(*filters)
+        .order_by(ExportRowExclusion.row_index)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.post("/{task_id}/runs/{run_id}/export/approve", response_model=ExportRunRead)
+def approve_task_run_export(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ExportRun:
+    """Module 9 approval state machine: pending_review -> approved only.
+    Direct mirror of approve_task_run_matching. A pure status transition
+    -- it does not rewrite, move, or delete the output file, and does not
+    trigger any further automatic action (no delivery, no cleanup)."""
+    export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if export_run.status != "pending_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot approve an export run with status '{export_run.status}'",
+        )
+    export_run.status = "approved"
+    export_run.approved_by = current_user.id
+    export_run.approved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(export_run)
+    return export_run
+
+
+@router.post("/{task_id}/runs/{run_id}/export/reject", response_model=ExportRunRead)
+def reject_task_run_export(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ExportRun:
+    """Module 9 approval state machine: pending_review -> rejected only."""
+    export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if export_run.status != "pending_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot reject an export run with status '{export_run.status}'",
+        )
+    export_run.status = "rejected"
+    export_run.rejected_by = current_user.id
+    export_run.rejected_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(export_run)
+    return export_run
+
+
+@router.post("/{task_id}/runs/{run_id}/export/rollback", response_model=ExportRunRead)
+def rollback_task_run_export(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ExportRun:
+    """Module 9 approval state machine: approved -> rolled_back only. A
+    pure status transition -- every ExportRowExclusion row and the output
+    file itself are untouched; rollback never deletes the physical export
+    file (same retention-policy gap already carried from Modules 6/7, now
+    extended to a third output-producing module -- see design doc Section
+    11/17)."""
+    export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if export_run.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot roll back an export run with status '{export_run.status}'",
+        )
+    export_run.status = "rolled_back"
+    export_run.rolled_back_by = current_user.id
+    export_run.rolled_back_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(export_run)
+    return export_run

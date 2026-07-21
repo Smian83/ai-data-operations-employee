@@ -167,6 +167,27 @@ class Settings(BaseSettings):
         default=20, alias="MATCH_MAX_SKIPPED_ROW_SAMPLE", gt=0
     )
 
+    # --- Data export engine (Module 9) ---
+    # Exported (deduplicated) output CSVs are written under this
+    # tenant-scoped root (CSV_EXPORTED_ROOT/{organization_id}/...),
+    # distinct from CSV_INPUT_ROOT, CSV_OUTPUT_ROOT, and
+    # CSV_STANDARDIZED_ROOT -- the Module 7 standardized file being
+    # exported is never opened for writing anywhere in this module (see
+    # app.worker.handlers.export). First output-writing module since
+    # Module 7; Module 8 deliberately wrote no file at all.
+    csv_exported_root: str = Field(
+        default="./data/csv_exported", alias="CSV_EXPORTED_ROOT"
+    )
+    # Caps individual ExportRowExclusion rows persisted per run; same
+    # bounded-but-never-silent pattern as CLEANING_MAX_PERSISTED_CHANGES/
+    # STANDARDIZATION_MAX_PERSISTED_CHANGES/MATCH_MAX_PERSISTED_DECISIONS
+    # -- ExportRun.excluded_row_count is always the true total even when
+    # this is capped. In practice already bounded transitively by
+    # CSV_MAX_ROWS, since exclusions can never exceed the input row count.
+    export_max_persisted_exclusions: int = Field(
+        default=10_000, alias="EXPORT_MAX_PERSISTED_EXCLUSIONS", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

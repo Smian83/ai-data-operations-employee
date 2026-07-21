@@ -233,7 +233,10 @@ def test_source_task_run_id_rejected_for_sync_task(client: TestClient) -> None:
         headers=headers,
     )
     assert response.status_code == 400, response.text
-    assert "only valid for TRANSFORM, STANDARDIZE, and MATCH" in response.json()["detail"]
+    assert "only valid for TRANSFORM, STANDARDIZE" in response.json()["detail"]
+    # Module 9 extended this message to include EXPORT -- assert the
+    # stable prefix only, same precedent test_cleaning_api.py already set
+    # for this exact message (asserting "only valid for TRANSFORM" alone).
 
 
 # --- GET .../matching summary/groups/decisions/skipped-blocks ---------------

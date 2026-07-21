@@ -92,3 +92,13 @@ MATCH_RULE_COMPARISON_TYPES = ("exact", "normalized_exact")
 # deliberately absent -- a pair scoring below the review threshold is
 # never persisted at all (Section 6/13), so there is no third value here.
 MATCH_DECISION_TYPES = ("duplicate", "ambiguous")
+
+
+# Module 9: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as STANDARDIZATION_RUN_STATUSES/MATCH_RUN_STATUSES
+# above, applied to the export engine's own run-approval state machine.
+# See docs/module-9-data-export-engine-design.md Section 10. Note: unlike
+# every module from 7 onward, Module 9 required NO new TaskType value --
+# TaskType.EXPORT already existed (see the class above), so there is no
+# accompanying comment there.
+EXPORT_RUN_STATUSES = ("pending_review", "approved", "rejected", "rolled_back")
