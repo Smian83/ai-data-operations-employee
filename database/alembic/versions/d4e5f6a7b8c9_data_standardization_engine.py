@@ -222,7 +222,14 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(
             ["organization_id"], ["organizations.id"],
-            name="fk_standardization_column_mappings_organization_id_organizations",
+            # Shortened from this project's usual fk_{table}_organization_id_
+            # organizations pattern (used by every other single-column org_id
+            # FK in this file/project) -- with this table's name,
+            # the full pattern is 64 characters, one over PostgreSQL's 63-byte
+            # identifier limit (caught by real PostgreSQL verification;
+            # SQLite never enforces this). Uses the same "_org_" abbreviation
+            # this file already uses for its multi-column FKs below.
+            name="fk_standardization_column_mappings_org_id",
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
@@ -281,7 +288,13 @@ def upgrade() -> None:
         ),
         sa.ForeignKeyConstraint(
             ["organization_id"], ["organizations.id"],
-            name="fk_standardization_lookup_entries_organization_id_organizations",
+            # Shortened for the same reason as standardization_column_
+            # mappings' organization_id FK above -- the full fk_{table}_
+            # organization_id_organizations pattern lands at exactly 63
+            # characters here (PostgreSQL's own limit), too fragile a margin
+            # to keep; shortened preemptively and consistently with the
+            # sibling table's fix.
+            name="fk_standardization_lookup_entries_org_id",
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
