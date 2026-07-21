@@ -2,7 +2,7 @@
 
 This is the single source of truth for this project's current state. It is updated before every merge to `main`, never left to drift out of date. Do not remove prior information here unless it is genuinely obsolete — extend, correct, and append.
 
-Last updated: after Module 6 (Data Cleaning Engine) merge into `main`, tag `v0.6`.
+Last updated: after Module 6 (Data Cleaning Engine), merge commit `94d8c27`, tag `v0.6`.
 
 ---
 
