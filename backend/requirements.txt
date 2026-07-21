@@ -29,3 +29,8 @@ email-validator==2.3.0
 # Execution engine (Module 4)
 cryptography==44.0.0
 prometheus-client==0.21.1
+
+# Data standardization engine (Module 7): deterministic E.164 phone
+# formatting via Google libphonenumber's offline metadata tables --
+# not AI/ML, no network calls (see the design doc Section 6).
+phonenumbers==9.0.34
