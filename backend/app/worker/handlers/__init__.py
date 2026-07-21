@@ -14,19 +14,28 @@ exact same pattern -- also a deliberate, non-additive behavior change: any
 Task with task_type=TRANSFORM now executes real CSV-cleaning logic instead
 of a no-op, and requires a completed DataProfile for the TaskRun's
 source_task_run_id or fails permanently (see CleaningHandler.execute).
-EXPORT and OTHER remain on NoOpHandler until their own follow-up
-modules."""
+
+Module 7 update: a NEW TaskType value, STANDARDIZE, now maps to
+StandardizationHandler -- purely additive to the registry (TRANSFORM,
+SYNC, EXPORT, and OTHER are all unaffected), since no existing task_type
+was available to reuse (see docs/module-7-data-standardization-engine-
+design.md Section 2 for why). A Task with task_type=STANDARDIZE requires
+an APPROVED CleaningRun for the TaskRun's source_task_run_id or fails
+permanently (see StandardizationHandler.execute). EXPORT and OTHER remain
+on NoOpHandler until their own follow-up modules."""
 from app.models.enums import TaskType
 from app.worker.handlers.base import ExecutionHandler
 from app.worker.handlers.cleaning import CleaningHandler
 from app.worker.handlers.csv_profiling import CsvProfilingHandler
 from app.worker.handlers.noop import NoOpHandler
+from app.worker.handlers.standardization import StandardizationHandler
 
 HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.SYNC: CsvProfilingHandler(),
     TaskType.TRANSFORM: CleaningHandler(),
     TaskType.EXPORT: NoOpHandler(),
     TaskType.OTHER: NoOpHandler(),
+    TaskType.STANDARDIZE: StandardizationHandler(),
 }
 
 

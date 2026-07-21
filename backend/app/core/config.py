@@ -124,6 +124,21 @@ class Settings(BaseSettings):
         default=10_000, alias="CLEANING_MAX_PERSISTED_CHANGES", gt=0
     )
 
+    # --- Data standardization engine (Module 7) ---
+    # Standardized output CSVs are written under this tenant-scoped root
+    # (CSV_STANDARDIZED_ROOT/{organization_id}/...), distinct from BOTH
+    # CSV_INPUT_ROOT and CSV_OUTPUT_ROOT -- the Module 6 output being
+    # standardized is never opened for writing anywhere in this module
+    # (see app.worker.handlers.standardization).
+    csv_standardized_root: str = Field(
+        default="./data/csv_standardized", alias="CSV_STANDARDIZED_ROOT"
+    )
+    # Caps individual StandardizationChange rows persisted per run; same
+    # bounded-but-never-silent pattern as CLEANING_MAX_PERSISTED_CHANGES.
+    standardization_max_persisted_changes: int = Field(
+        default=10_000, alias="STANDARDIZATION_MAX_PERSISTED_CHANGES", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
