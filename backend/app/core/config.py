@@ -139,6 +139,34 @@ class Settings(BaseSettings):
         default=10_000, alias="STANDARDIZATION_MAX_PERSISTED_CHANGES", gt=0
     )
 
+    # --- Data matching & deduplication engine (Module 8) ---
+    # No csv_matched_root setting -- Module 8 produces no output file at
+    # all (see docs/module-8-data-matching-deduplication-design.md
+    # Section 2's architectural decision); MatchHandler never opens a new
+    # file for writing anywhere.
+    #
+    # A block whose size exceeds this bound is skipped entirely (no
+    # pairwise comparisons performed within it); the skip is always
+    # surfaced via MatchRun.skipped_block_count and a MatchSkippedBlock
+    # audit row, never silent.
+    match_max_block_size: int = Field(
+        default=1_000, alias="MATCH_MAX_BLOCK_SIZE", gt=0
+    )
+    # Caps individual MatchDecision rows persisted per run; same
+    # bounded-but-never-silent pattern as CLEANING_MAX_PERSISTED_CHANGES/
+    # STANDARDIZATION_MAX_PERSISTED_CHANGES -- MatchRun's aggregate counts
+    # (duplicate_pairs_count, ambiguous_pairs_count, total_comparisons_
+    # count) are always the true totals even when this is capped.
+    match_max_persisted_decisions: int = Field(
+        default=10_000, alias="MATCH_MAX_PERSISTED_DECISIONS", gt=0
+    )
+    # Caps the row_index sample recorded per skipped block
+    # (MatchSkippedBlock.sample_row_indices) -- block_size on that same
+    # row is always the true, uncapped count.
+    match_max_skipped_row_sample: int = Field(
+        default=20, alias="MATCH_MAX_SKIPPED_ROW_SAMPLE", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

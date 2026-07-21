@@ -27,6 +27,11 @@ class TaskType(str, enum.Enum):
     # reserved/generic per the handler registry's own docstring. See
     # docs/module-7-data-standardization-engine-design.md Section 2.
     STANDARDIZE = "standardize"
+    # Module 8: another new value, same reasoning -- none of SYNC/
+    # TRANSFORM/STANDARDIZE/EXPORT/OTHER can be reused without overloading
+    # an existing meaning. See
+    # docs/module-8-data-matching-deduplication-design.md Section 2.
+    MATCH = "match"
 
 
 class TaskRunStatus(str, enum.Enum):
@@ -67,3 +72,23 @@ STANDARDIZATION_FIELD_TYPES = (
     "numeric",
     "currency",
 )
+
+
+# Module 8: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as STANDARDIZATION_RUN_STATUSES above, applied to the
+# matching/deduplication engine's own run-approval state machine and
+# per-decision/per-field small closed sets. See
+# docs/module-8-data-matching-deduplication-design.md Section 3.
+MATCH_RUN_STATUSES = ("pending_review", "approved", "rejected", "rolled_back")
+
+# comparison_type values a MatchRuleField may declare (Section 6/7 of the
+# Module 8 design doc). No fuzzy/phonetic/approximate options exist --
+# this fixed, closed set IS the "no AI/ML/approximate matching" boundary,
+# enforced here (Pydantic layer) and via a matching CHECK constraint
+# (database layer).
+MATCH_RULE_COMPARISON_TYPES = ("exact", "normalized_exact")
+
+# decision values a MatchDecision may record. "not_duplicate" is
+# deliberately absent -- a pair scoring below the review threshold is
+# never persisted at all (Section 6/13), so there is no third value here.
+MATCH_DECISION_TYPES = ("duplicate", "ambiguous")

@@ -22,6 +22,12 @@ from app.models.cleaning_run import CleaningRun
 from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
 from app.models.enums import TaskType
+from app.models.match_decision import MatchDecision
+from app.models.match_group import MatchGroup
+from app.models.match_rule_field import MatchRuleField
+from app.models.match_rule_set import MatchRuleSet
+from app.models.match_run import MatchRun
+from app.models.match_skipped_block import MatchSkippedBlock
 from app.models.standardization_change import StandardizationChange
 from app.models.standardization_column_mapping import StandardizationColumnMapping
 from app.models.standardization_lookup_entry import StandardizationLookupEntry
@@ -33,6 +39,11 @@ from app.models.user import User
 from app.schemas.cleaning_change import CleaningChangeRead
 from app.schemas.cleaning_run import CleaningRunRead
 from app.schemas.data_profile import DataProfileRead
+from app.schemas.match_decision import MatchDecisionRead
+from app.schemas.match_group import MatchGroupRead
+from app.schemas.match_rule_set import MatchRuleSetCreate, MatchRuleSetRead
+from app.schemas.match_run import MatchRunRead
+from app.schemas.match_skipped_block import MatchSkippedBlockRead
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.standardization_change import StandardizationChangeRead
 from app.schemas.standardization_column_mapping import (
@@ -235,25 +246,29 @@ def create_task_run(
 ) -> TaskRun:
     """Module 6: payload is optional -- omitted entirely, it behaves exactly
     as before. source_task_run_id is required for TRANSFORM tasks (which
-    prior SYNC run's DataProfile to clean) and, as of Module 7, for
-    STANDARDIZE tasks too (which prior TRANSFORM run's approved CleaningRun
-    to standardize) -- same required/rejected branch extended to a second
-    task_type, still rejected for every other task type, so the field's
-    meaning can never be ambiguous per task. This API-layer check only
-    confirms the referenced run exists in the same org; the deeper
-    "must be an approved CleaningRun" check for STANDARDIZE stays in
-    StandardizationHandler, exactly as TRANSFORM's DataProfile check stays
-    in CleaningHandler."""
+    prior SYNC run's DataProfile to clean), for STANDARDIZE tasks (which
+    prior TRANSFORM run's approved CleaningRun to standardize), and, as of
+    Module 8, for MATCH tasks too (which prior STANDARDIZE run's approved
+    StandardizationRun to match/deduplicate) -- same required/rejected
+    branch extended to a third task_type, still rejected for every other
+    task type, so the field's meaning can never be ambiguous per task.
+    This API-layer check only confirms the referenced run exists in the
+    same org; the deeper "must be an approved StandardizationRun" check
+    for MATCH stays in MatchHandler, exactly as STANDARDIZE's CleaningRun
+    check stays in StandardizationHandler."""
     # Inactive or cross-org task -> 404, same as any other direct access.
     task = _get_active_task_or_404(db, task_id, current_user.organization_id)
 
     source_task_run_id = payload.source_task_run_id if payload is not None else None
 
-    if task.task_type in (TaskType.TRANSFORM, TaskType.STANDARDIZE):
+    if task.task_type in (TaskType.TRANSFORM, TaskType.STANDARDIZE, TaskType.MATCH):
         if source_task_run_id is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="source_task_run_id is required for TRANSFORM and STANDARDIZE tasks",
+                detail=(
+                    "source_task_run_id is required for TRANSFORM, STANDARDIZE, "
+                    "and MATCH tasks"
+                ),
             )
         source_run_exists = db.execute(
             select(TaskRun.id).where(
@@ -269,7 +284,10 @@ def create_task_run(
     elif source_task_run_id is not None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="source_task_run_id is only valid for TRANSFORM and STANDARDIZE tasks",
+            detail=(
+                "source_task_run_id is only valid for TRANSFORM, STANDARDIZE, "
+                "and MATCH tasks"
+            ),
         )
 
     run = TaskRun(
@@ -927,3 +945,368 @@ def delete_standardization_lookup_entry(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lookup entry not found")
     entry.is_active = False
     db.commit()
+
+
+# --- Module 8: data matching & deduplication --------------------------------
+
+
+def _get_match_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> MatchRun:
+    """Shared 404 chain for every matching-result endpoint: task visible ->
+    run visible -> match result exists. Direct mirror of
+    _get_standardization_run_or_404."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    run_exists = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if run_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    match_run = db.execute(
+        select(MatchRun).where(
+            MatchRun.task_run_id == run_id,
+            MatchRun.task_id == task.id,
+            MatchRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if match_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Match result not found")
+    return match_run
+
+
+@router.get("/{task_id}/runs/{run_id}/matching", response_model=MatchRunRead)
+def get_task_run_matching(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MatchRun:
+    """Module 8: the summary result of a MATCH TaskRun -- counts,
+    confidence, and current approval status. No output-file fields --
+    Module 8 produces no output file (see
+    docs/module-8-data-matching-deduplication-design.md Section 2). 404 if
+    the run isn't visible to this org, or no match result exists yet."""
+    return _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/matching/groups",
+    response_model=PaginatedResponse[MatchGroupRead],
+)
+def list_task_run_matching_groups(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[MatchGroupRead]:
+    """Module 8: the duplicate clusters found by a MATCH run, in
+    canonical_row_index order. Full group membership is reconstructable
+    from GET .../matching/decisions?match_group_id=... (record_a_row_index/
+    record_b_row_index across every decision in that group)."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+    filters = [
+        MatchGroup.match_run_id == match_run.id,
+        MatchGroup.organization_id == current_user.organization_id,
+    ]
+    total = db.execute(select(func.count()).select_from(MatchGroup).where(*filters)).scalar_one()
+    rows = db.execute(
+        select(MatchGroup)
+        .where(*filters)
+        .order_by(MatchGroup.canonical_row_index)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/matching/decisions",
+    response_model=PaginatedResponse[MatchDecisionRead],
+)
+def list_task_run_matching_decisions(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    decision: str | None = Query(default=None),
+    match_group_id: uuid.UUID | None = Query(default=None),
+    blocking_key: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[MatchDecisionRead]:
+    """Module 8: the bounded pairwise-comparison audit log for a match
+    run. ?decision=duplicate/?decision=ambiguous is the organization's
+    reviewable "ambiguous match" queue -- a dedicated surface for exactly
+    the records the acceptance criteria say must never be silently
+    merged. ?match_group_id=... shows every decision that contributed to
+    one specific group. ?blocking_key=... (new in the approved design
+    revision) is the direct query surface for "why was this pair
+    compared" -- see GET .../matching/skipped-blocks for the mirror-image
+    "why was this pair never compared" question. Note this may
+    under-represent duplicate_pairs_count/ambiguous_pairs_count on
+    MatchRun for a run whose comparison volume exceeded
+    MATCH_MAX_PERSISTED_DECISIONS; the aggregate counts on the parent
+    MatchRun are always accurate even when the per-decision rows are
+    capped."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+    if decision is not None and decision not in ("duplicate", "ambiguous"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="decision must be 'duplicate' or 'ambiguous'",
+        )
+
+    filters = [
+        MatchDecision.match_run_id == match_run.id,
+        MatchDecision.organization_id == current_user.organization_id,
+    ]
+    if decision is not None:
+        filters.append(MatchDecision.decision == decision)
+    if match_group_id is not None:
+        filters.append(MatchDecision.match_group_id == match_group_id)
+    if blocking_key is not None:
+        filters.append(MatchDecision.blocking_key == blocking_key)
+
+    total = db.execute(
+        select(func.count()).select_from(MatchDecision).where(*filters)
+    ).scalar_one()
+    rows = db.execute(
+        select(MatchDecision)
+        .where(*filters)
+        .order_by(MatchDecision.record_a_row_index, MatchDecision.record_b_row_index)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/matching/skipped-blocks",
+    response_model=PaginatedResponse[MatchSkippedBlockRead],
+)
+def list_task_run_matching_skipped_blocks(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[MatchSkippedBlockRead]:
+    """Module 8 (new in the approved design revision): the bounded audit
+    log of blocks skipped for exceeding MATCH_MAX_BLOCK_SIZE -- the direct
+    query surface for "why was this pair never compared." Bounded by
+    construction (row_count / MATCH_MAX_BLOCK_SIZE per run), so pagination
+    here is a formality, not a necessity."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+    filters = [
+        MatchSkippedBlock.match_run_id == match_run.id,
+        MatchSkippedBlock.organization_id == current_user.organization_id,
+    ]
+    total = db.execute(
+        select(func.count()).select_from(MatchSkippedBlock).where(*filters)
+    ).scalar_one()
+    rows = db.execute(
+        select(MatchSkippedBlock)
+        .where(*filters)
+        .order_by(MatchSkippedBlock.blocking_key)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.post("/{task_id}/runs/{run_id}/matching/approve", response_model=MatchRunRead)
+def approve_task_run_matching(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MatchRun:
+    """Module 8 approval state machine: pending_review -> approved only.
+    Direct mirror of approve_task_run_standardization. A pure status
+    transition -- it does not merge, delete, or modify any record, any
+    file, or any other database row; Module 8 never performs any physical
+    merge or deletion at any point in its lifecycle, approved or not (see
+    design doc Section 2/10)."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if match_run.status != "pending_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot approve a match run with status '{match_run.status}'",
+        )
+    match_run.status = "approved"
+    match_run.approved_by = current_user.id
+    match_run.approved_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(match_run)
+    return match_run
+
+
+@router.post("/{task_id}/runs/{run_id}/matching/reject", response_model=MatchRunRead)
+def reject_task_run_matching(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MatchRun:
+    """Module 8 approval state machine: pending_review -> rejected only."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if match_run.status != "pending_review":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot reject a match run with status '{match_run.status}'",
+        )
+    match_run.status = "rejected"
+    match_run.rejected_by = current_user.id
+    match_run.rejected_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(match_run)
+    return match_run
+
+
+@router.post("/{task_id}/runs/{run_id}/matching/rollback", response_model=MatchRunRead)
+def rollback_task_run_matching(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MatchRun:
+    """Module 8 approval state machine: approved -> rolled_back only. A
+    pure status transition -- every MatchGroup/MatchDecision/
+    MatchSkippedBlock row is untouched, and since nothing destructive ever
+    happened at approval time in the first place (Section 2/10), this is a
+    structurally simpler, lower-risk rollback than Modules 6/7's."""
+    match_run = _get_match_run_or_404(db, task_id, run_id, current_user.organization_id)
+    if match_run.status != "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot roll back a match run with status '{match_run.status}'",
+        )
+    match_run.status = "rolled_back"
+    match_run.rolled_back_by = current_user.id
+    match_run.rolled_back_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(match_run)
+    return match_run
+
+
+# --- Match rule-set configuration (Module 8 org-level CRUD) ------------------
+#
+# Not task-run-scoped -- organization-wide configuration MatchHandler
+# consults on every run (see app/worker/handlers/matching.py's
+# _load_rule_set). Same "/tasks/matching/..." path-prefix precedent
+# Module 7's standardization config endpoints already established. Rule
+# sets (and their field lists) are immutable once created: no PATCH/PUT,
+# and no DELETE -- creating a new version automatically deactivates the
+# prior active one for the same scope in the same transaction (soft
+# "supersede," never a hard delete), so every historical MatchRun.
+# rule_set_id/rule_set_version stays resolvable.
+
+
+@router.post(
+    "/matching/rule-sets", response_model=MatchRuleSetRead, status_code=status.HTTP_201_CREATED
+)
+def create_match_rule_set(
+    payload: MatchRuleSetCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> MatchRuleSet:
+    """Create a new, versioned MatchRuleSet (and its full field list) for
+    an organization, either scoped to one data source or (data_source_id
+    omitted) applied org-wide. version is computed server-side; creating
+    a new rule set for a scope deactivates any prior active rule set for
+    that same scope in the same transaction -- the old version remains
+    readable (is_active=false), never deleted, so any MatchRun that cites
+    it stays fully interpretable."""
+    if payload.data_source_id is not None:
+        _validate_data_source_ref(db, payload.data_source_id, current_user.organization_id)
+
+    existing_count = db.execute(
+        select(func.count())
+        .select_from(MatchRuleSet)
+        .where(
+            MatchRuleSet.organization_id == current_user.organization_id,
+            MatchRuleSet.data_source_id == payload.data_source_id,
+        )
+    ).scalar_one()
+
+    prior_active = db.execute(
+        select(MatchRuleSet).where(
+            MatchRuleSet.organization_id == current_user.organization_id,
+            MatchRuleSet.data_source_id == payload.data_source_id,
+            MatchRuleSet.is_active.is_(True),
+        )
+    ).scalar_one_or_none()
+    if prior_active is not None:
+        prior_active.is_active = False
+
+    rule_set = MatchRuleSet(
+        organization_id=current_user.organization_id,
+        data_source_id=payload.data_source_id,
+        version=existing_count + 1,
+        duplicate_threshold=payload.duplicate_threshold,
+        review_threshold=payload.review_threshold,
+        created_by=current_user.id,
+    )
+    db.add(rule_set)
+    db.flush()
+    for field_payload in payload.fields:
+        db.add(
+            MatchRuleField(
+                organization_id=current_user.organization_id,
+                rule_set_id=rule_set.id,
+                column_name=field_payload.column_name,
+                comparison_type=field_payload.comparison_type,
+                weight=field_payload.weight,
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An active rule set for this scope was just created by another request",
+        )
+    db.refresh(rule_set)
+    return rule_set
+
+
+@router.get("/matching/rule-sets", response_model=PaginatedResponse[MatchRuleSetRead])
+def list_match_rule_sets(
+    pagination: PaginationParams = Depends(),
+    include_inactive: bool = Query(default=False),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[MatchRuleSetRead]:
+    filters = [MatchRuleSet.organization_id == current_user.organization_id]
+    if not include_inactive:
+        filters.append(MatchRuleSet.is_active.is_(True))
+
+    total = db.execute(select(func.count()).select_from(MatchRuleSet).where(*filters)).scalar_one()
+    rows = db.execute(
+        select(MatchRuleSet)
+        .where(*filters)
+        .order_by(MatchRuleSet.created_at.desc())
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    return PaginatedResponse(
+        items=list(rows), total=total, limit=pagination.limit, offset=pagination.offset
+    )
