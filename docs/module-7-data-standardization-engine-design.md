@@ -1,0 +1,201 @@
+# Module 7 — Data Standardization Engine
+## Design Specification (Design Only — No Code)
+
+---
+
+This spec was written against the actual current codebase (`main` at commit `0c5e517`, tag `v0.6`, Alembic head `c3d4e5f6a7b8`) — every reuse claim below (handler shape, tenant FK convention, approval state machine, idempotency mechanism, bounded/sampled persistence, enum DDL ownership) is drawn from files read directly in this repository, not assumed.
+
+## 1. Goals
+
+- Standardize data that Module 6 has already cleaned and a human has already approved — standardization is the third stage of the pipeline (profile → clean → standardize), never a replacement for either earlier stage and never applied to raw, unprofiled, or unapproved data.
+- Provide deterministic, rule-based standardization for seventeen field types: person names, company names, email addresses, phone numbers (E.164 where resolvable), postal addresses, cities, states/provinces, countries (ISO codes where appropriate), postal/ZIP codes, dates, times, booleans, numeric formats, currency formats, common abbreviations, letter casing, and whitespace.
+- Record every changed value with its rule, confidence, reason, and timestamp — the same audit discipline Module 6 established, applied to a wider rule surface.
+- Require explicit human approval before a standardization result is treated as authoritative, with instant, non-destructive rollback.
+- Support organization-specific standardization behavior: which column maps to which field type, and organization-supplied lookup-table entries (abbreviation expansions, canonical company suffixes, etc.) that override the built-in defaults.
+- Never use AI, ML, or any non-deterministic technique anywhere in the standardization path. Every transformation is a named, versioned, pure function or a static/configured lookup table.
+- Reuse Module 4's execution engine, Module 5/6's tenant-scoped file I/O and approval-state-machine pattern, Module 3's validation helpers, and the existing API conventions without modification — Module 7 is a new handler and a new data surface on unchanged infrastructure, exactly as Module 6 was on Module 5's.
+
+## 2. Architecture
+
+Module 7 sits one stage downstream of Module 6, on the same unchanged execution substrate:
+
+```
+Task (task_type = STANDARDIZE)
+  │
+  ▼
+TaskRun  (source_task_run_id → the TRANSFORM run whose approved
+          CleaningRun output is being standardized)
+  │
+  ▼
+Worker claims run  →  StandardizationHandler.execute(context)
+  │
+  ├─ reads: CleaningRun (Module 6, unchanged, must be status=approved)
+  │         + the cleaned CSV at CleaningRun.output_file_path
+  │         (via the same tenant-scoped loader Module 5/6 already use)
+  │
+  ├─ classifies: each column to a field_type (org override, else
+  │              built-in header-name heuristic, else "unclassified")
+  │
+  ├─ computes: standardized rows + a bounded list of per-cell changes
+  │            (pure, in-memory, no I/O, no AI)
+  │
+  └─ writes: one new output CSV (new location, never the Module 6
+             output path, never the original source)
+             + one StandardizationRun row + bounded
+             StandardizationChange rows
+```
+
+**Reused without modification:** `app/worker/engine.py`, `reaper.py`, `metrics.py`, `runner.py` (Module 4's claim/lease/heartbeat/retry engine); `app/profiling/csv_loader.py` (`resolve_source_path`, `load_csv`, `CsvLimits` — the same bounded, tenant-scoped, read-only I/O Module 5 and Module 6 already use, unmodified); `app/core/validation.py` (`find_secret_like_key`, `normalize_name` — Module 3's validation framework, applied to the two new organization-configuration tables in Section 3); the `CleaningRun`/`CleaningChange` approval-state-machine *pattern* (not the tables themselves — Module 7 gets its own, mirroring Module 6's exactly, per Section 7); `TaskRun.source_task_run_id` (Module 6's additive, self-referential, generic "prior run this run is derived from" pointer — already generic enough to point at a `TRANSFORM` run instead of a `SYNC` run with zero schema change).
+
+**The only integration seams into existing code:**
+1. `HANDLER_REGISTRY[TaskType.STANDARDIZE]` — a new registry entry (see the required `TaskType` addition below; `EXPORT` and `OTHER` are already reserved for other purposes per the registry's own docstring and stay on `NoOpHandler`).
+2. `POST /tasks/{id}/runs`' existing `TaskRunCreate.source_task_run_id` validation gains one more accepted `task_type` (`STANDARDIZE`), following the exact same required/rejected branching Module 6 already added for `TRANSFORM`.
+
+**Architectural decision — a new `TaskType.STANDARDIZE` enum value is required, not a reuse of an existing one.** Module 6 was able to reuse `TaskType.TRANSFORM` because the handler registry's own docstring had already reserved it for exactly this purpose. No such reservation exists for standardization: `SYNC` means profiling, `TRANSFORM` now means cleaning, `EXPORT` is explicitly reserved for a future export handler, and `OTHER` is the generic no-op fallback used by nothing in particular. Reusing any of these would make that task type mean two unrelated things depending on context, which breaks the one-handler-per-type invariant the registry is built on. The trade-off is real and worth naming: adding a native PostgreSQL enum value requires `ALTER TYPE ... ADD VALUE` (Section 3) instead of Module 6's simpler "just start using an already-reserved value" — more migration surface, but the only option that doesn't overload an existing type's meaning. Recommended and proceeding with it.
+
+## 3. Database Changes
+
+**One enum addition.** `task_type_enum` gains a fourth-used value, `standardize` (`TaskType.STANDARDIZE`). This is the first time this project has extended an *existing* native enum rather than creating a new one, so the migration mechanics differ from every prior enum-touching migration and are spelled out precisely:
+
+- **PostgreSQL:** `ALTER TYPE task_type_enum ADD VALUE IF NOT EXISTS 'standardize'`. As of PostgreSQL 12 (this project targets 16), `ADD VALUE` can run inside a normal transaction, but the newly added label cannot be *used* (e.g. in an `INSERT`/`CHECK` comparison) within that same transaction — it must be committed first. Alembic migrations in this project already run as a single transaction per revision by default; this migration's `upgrade()` must therefore issue the `ALTER TYPE` as its own statement and rely on Alembic's autocommit block (`op.get_context().autocommit_block()`) for it, matching the documented psycopg/Alembic pattern for this exact PostgreSQL restriction — not a new technique invented for this project, a documented requirement of `ADD VALUE` itself.
+- **SQLite:** there is no native enum type; `task_type_enum`'s `create_constraint=True` currently materializes as a `CHECK (task_type IN (...))` embedded in the `tasks` table's column definition. Adding a value means rebuilding that constraint, which on SQLite means the standard `op.batch_alter_table("tasks")` table-recreate Alembic already uses elsewhere in this project for SQLite-incompatible changes — not a new pattern.
+- **Downgrade:** PostgreSQL has no `DROP VALUE` for enum types. The documented, standard approach (and the one this migration's `downgrade()` uses) is to leave the enum label in place on downgrade — removing it would require rebuilding the entire type and every column/table that references it, which is out of proportion to what a downgrade needs to accomplish. This is a one-directional migration in the same sense Postgres enum additions always are; it does not affect the `alembic downgrade base → upgrade head` cycle correctness, since no row will contain the `standardize` value after a genuine downgrade-then-reupgrade in a fresh verification database.
+
+**Two new tables**, directly mirroring `cleaning_runs`/`cleaning_changes`' shape and every one of their constraints (tenant FK pattern, `UniqueConstraint(organization_id, id)` for composite-FK-targeting — the exact thing Module 6 initially missed and had to add, not repeating that mistake here):
+
+- `standardization_runs` — one row per `STANDARDIZE` `TaskRun` (`UniqueConstraint(task_run_id)`), composite tenant FKs to `task_runs` (`task_run_id`, CASCADE), `tasks` (RESTRICT), `data_sources` (RESTRICT), and `task_runs` again (`source_task_run_id`, RESTRICT — the `TRANSFORM` run being standardized). Columns: identifiers, `output_file_path`, `output_sha256`, `row_count`, `total_changes_count`, `changes_by_rule` (JSON), `confidence_score` (minimum-across-changes, same semantics as `CleaningRun`), `standardization_engine_version` (String(20), NOT NULL), `status` (String(20), default `pending_review`, `CHECK IN ('pending_review','approved','rejected','rolled_back')` — plain string, not a native enum, matching `TaskRunEvent.event_type` and `CleaningRun.status`'s existing precedent, for the same reason: this project has hit the native-enum-DDL-ownership bug class twice and does not repeat it for small, internal, worker-owned state fields), `approved_by`/`approved_at`, `rejected_by`/`rejected_at`, `rolled_back_by`/`rolled_back_at`, `created_at`.
+- `standardization_changes` — many rows per `standardization_runs` row, capped per Section 9, composite tenant FK to `standardization_runs` (CASCADE). Columns: `row_index`, `column_name`, `field_type` (the classification that produced this change — new relative to `CleaningChange`, since Module 7's rules are field-type-scoped rather than data-type-scoped), `original_value`, `standardized_value`, `rule_name`, `reason`, `confidence_score`, `created_at`.
+
+**Two new organization-configuration tables** — new relative to Module 6, required by the "organization-specific rules" and "configurable lookup tables" acceptance criteria, but following the exact same tenant-scoped-table convention every table since Module 3 uses (`organization_id`, `is_active` soft delete, partial unique index on the active-row uniqueness key):
+
+- `standardization_column_mappings` — lets an organization explicitly declare a column's `field_type`, overriding the built-in header-name heuristic (Section 6). Columns: `id`, `organization_id`, `data_source_id` (nullable — null means "applies to every data source in this org"; composite tenant FK when set, RESTRICT), `column_name` (case-insensitive match), `field_type` (String, validated against the fixed field-type registry at the API layer, not a native enum — this is org-supplied configuration data, not worker-owned execution state, but still a small closed set better validated in Pydantic than given its own Postgres type, matching `TaskRunEvent.event_type`'s existing precedent for "small internal value set → plain string" one more time), `is_active`, `created_by`, `created_at`. Partial unique index on `(organization_id, data_source_id, lower(trim(column_name)))` where `is_active` — the same soft-delete-plus-partial-unique-index pattern every named resource in this project uses.
+- `standardization_lookup_entries` — organization-supplied lookup-table entries (abbreviation expansions, canonical company suffixes, custom value mappings). Columns: `id`, `organization_id`, `field_type` (nullable — null means "applies across field types," e.g. a generic abbreviation), `lookup_key` (the input value or pattern, case-insensitive), `lookup_value` (the canonical output), `is_active`, `created_by`, `created_at`. Partial unique index on `(organization_id, field_type, lower(trim(lookup_key)))` where `is_active`.
+
+Both new configuration tables' `column_name`/`lookup_key`/`lookup_value` fields go through `app.core.validation.normalize_name` (trim) at the Pydantic layer, the same helper `Task.name`/`DataSource.name` already use — reused unchanged, not reimplemented.
+
+**Zero changes** to `cleaning_runs`, `cleaning_changes`, `data_profiles`, or any Module 1–6 table. `task_runs.source_task_run_id` (Module 6, already nullable and generic) is reused as-is with no new column.
+
+Migration: one new file, `down_revision` pointing at the current head (`c3d4e5f6a7b8`) — a single new head, verified before merge exactly as every prior module's migration was.
+
+## 4. Worker Flow
+
+No changes to `app/worker/engine.py`, `reaper.py`, `metrics.py`, or `runner.py`. A standardization run is claimed, leased, heartbeated, retried, and completed by the exact same code path a cleaning or profiling run uses today — `HANDLER_REGISTRY[TaskType.STANDARDIZE]` is a one-entry registry change, not new dispatch logic, and the runner's existing generic exception catch-all already treats an unhandled error inside a standardization rule as a retryable failure, exactly as it does for every other handler.
+
+`StandardizationHandler.execute` mirrors `CleaningHandler.execute`'s five-stage shape:
+
+1. **Resolve inputs.** Validate the data source is an active `CSV_UPLOAD` (same check `CleaningHandler` already does). Validate `context.task_run.source_task_run_id` is set. Look up the `CleaningRun` for that `source_task_run_id`, scoped by org — missing is a permanent failure ("standardization requires a completed cleaning run for source_task_run_id"). **Require `CleaningRun.status == "approved"`** — a `pending_review`, `rejected`, or `rolled_back` cleaning result is not yet authoritative and must not feed standardization; this is a permanent failure, not a retryable one, since the condition won't resolve on its own without a human decision on the cleaning run. Check for an existing `StandardizationRun` by `task_run_id` first (idempotency short-circuit, same pattern as `CleaningHandler`).
+2. **Load.** Read `CleaningRun.output_file_path` — the tenant-scoped Module 6 output, not `CSV_INPUT_ROOT` and not the original source — via the existing, unchanged `load_csv`/`CsvLimits`. No new size/row/column limit logic.
+3. **Classify.** For each column, resolve a `field_type`: an active `standardization_column_mappings` row for this org/data-source (or org-wide) takes precedence; otherwise the built-in header-name heuristic (Section 6) is tried; otherwise the column is `unclassified` and no standardization rule is applied to it (a column left alone is always a safe, valid outcome — never a forced guess).
+4. **Standardize.** Run the field-type-specific rule set (Section 6) over every classified column's values, producing standardized rows plus a change list. Organization `standardization_lookup_entries` are consulted wherever a rule's built-in default lookup table would otherwise apply, with org entries taking precedence over the built-in defaults for the same key.
+5. **Materialize output, persist and score.** Write standardized rows to a new file under a tenant-scoped output root (`CSV_STANDARDIZED_ROOT/{organization_id}/`, distinct from both `CSV_INPUT_ROOT` and `CSV_OUTPUT_ROOT`); hash it (SHA-256, same as Modules 5/6). Compute confidence (minimum across applied changes, same semantics). Write `StandardizationRun` + bounded `StandardizationChange` rows in one transaction, using the identical unique-constraint-plus-refetch idempotency pattern `CsvProfilingHandler` and `CleaningHandler` both already use (including the same `id=uuid.uuid4()`-assigned-explicitly-before-flush fix Module 6's integration testing surfaced — applied here from the start, not discovered again). Set initial status `pending_review`.
+
+## 5. API Endpoints
+
+All additive, all under the existing `tasks` router, following Module 6's precedent of extending the same file rather than introducing a new one; no existing endpoint's signature, response model, or behavior changes.
+
+- `POST /tasks/{id}/runs` — `TaskRunCreate.source_task_run_id` becomes required for `STANDARDIZE` tasks too (same `400`/`404` validation branch already added for `TRANSFORM`, extended to a second `task_type`), and remains rejected for `SYNC`/`EXPORT`/`OTHER`. The API-layer check confirms the referenced run exists in the same org (existence + tenant scoping only); the deeper "must be an approved `CleaningRun`" check stays in the handler, exactly mirroring how `TRANSFORM`'s API-layer check doesn't verify a `DataProfile` exists either — that's `CleaningHandler`'s job. Same validation-layering precedent, not a new one.
+- `GET /tasks/{id}/runs/{run_id}/standardization` — the run summary (counts, confidence, output location/hash, approval status). `404` if the run isn't visible to the caller's org or no result exists yet. Mirrors `GET .../cleaning` exactly.
+- `GET /tasks/{id}/runs/{run_id}/standardization/changes` — paginated per-cell change log, same shape as `GET .../cleaning/changes` and the Module 4 task-run-events endpoint.
+- `POST /tasks/{id}/runs/{run_id}/standardization/approve` / `.../reject` / `.../rollback` — the identical three-endpoint approval state machine Module 6 already implements (`pending_review → approved`/`rejected`, `approved → rolled_back`, `409` on any other starting status), reused pattern-for-pattern with the model swapped.
+- **Organization configuration CRUD** (new surface, since Module 6 had no equivalent — nothing in Module 6 was organization-configurable): `POST`/`GET`/`DELETE` (soft delete via `is_active=False`, exactly like `DELETE /tasks/{id}` does today, not a hard delete) on `/standardization/column-mappings` and `/standardization/lookup-entries`, both under a new but consistent path prefix, both requiring `get_current_active_user` like every other endpoint (no new auth mechanism), scoped to `current_user.organization_id` exactly like every other write in this project.
+
+## 6. Rule Engine
+
+`app/standardization/`, mirroring `app/cleaning/`'s package shape (`types.py`, `engine.py`, one rules module per concern) but split further given the larger rule surface — one `rules/` sub-module per field-type family rather than one flat `rules.py`, still every function pure, no I/O, no randomness, no wall-clock/locale dependence beyond what's passed in explicitly as configuration. `STANDARDIZATION_ENGINE_VERSION` (initial `"1.0"`) is bumped whenever any rule's *output* could change for existing input, mirroring `CLEANING_ENGINE_VERSION`'s exact contract.
+
+**Field-type classification (the entry point).** A fixed registry of field types (the seventeen listed in Section 1, plus `unclassified`) — not an open-ended or freeform set, since org-supplied `field_type` values on `standardization_column_mappings` are validated against this exact registry at the Pydantic layer. Built-in header-name heuristic: a fixed, versioned dictionary of column-header patterns (e.g. `email`/`e-mail`/`e_mail` → `email`; `phone`/`tel`/`mobile` → `phone`; `country` → `country`; `state`/`province` → `state_province`; `zip`/`postal` → `postal_code`) checked case-insensitively against the header after whitespace trim. Header-name heuristics are inherently ambiguous for oddly-named columns (a column literally named `"code"` could mean postal code, a product code, or something else entirely) — the mitigation is structural, not statistical: an unmatched or ambiguous header classifies as `unclassified` and receives zero standardization changes, never a guess, and organization-level explicit `standardization_column_mappings` always take precedence over the heuristic and are the recommended production configuration for anything the heuristic doesn't confidently cover.
+
+**Shared primitives, reused rather than reimplemented:**
+- Whitespace trim/collapse: `app.cleaning.rules.trim_whitespace`, imported directly, not duplicated — data reaching Module 7 has already been through Module 6, but a second pass is cheap, deterministic, and defensive.
+- Blank normalization: `app.cleaning.rules.normalize_blank`, same reuse.
+- Casing normalization (new, Module 7-specific): a small set of deterministic casing functions — title-case (person/company names, cities, street lines), upper-case (state/country codes, currency codes), lower-case (emails) — each a pure string transform, no locale-aware "smart" title-casing (e.g. no special-casing "McDonald" or "O'Brien"); this is a deliberate, named scope limit (see Section 11), not an oversight.
+
+**Per-field-type rules (each returns `(value, rule_name_or_None, confidence, reason)` against a fixed `RULE_CONFIDENCE`/`RULE_REASONS` table, same shape Module 6 established):**
+
+- **Person names / Company names.** Whitespace + casing (title-case) only by default. Company names additionally consult `standardization_lookup_entries` (field_type=`company_name`) for organization-configured suffix canonicalization (e.g. "Inc" / "Inc." / "Incorporated" → the org's configured preferred form); no built-in default suffix table ships, since "correct" is org policy, not a fact — an org that wants this must configure it. No structural changes (e.g. no "Last, First" → "First Last" reordering) — explicitly out of scope, a content-meaning change, not a format normalization.
+- **Email addresses.** Lower-case, whitespace-trim, and a conservative syntactic well-formedness check (single `@`, non-empty local/domain parts) — malformed values are left untouched and flagged with a `reason` noting the syntax issue, never rewritten/guessed.
+- **Phone numbers (E.164 where applicable).** Uses the `phonenumbers` library (pure-Python, MIT-licensed, a deterministic implementation of Google's libphonenumber metadata tables — not AI, not ML, not a network call; the same class of well-tested deterministic parsing library this project already effectively endorses by using `python-json-logger`/`pyjwt` for their respective well-defined formats). E.164 conversion is only attempted when a country can be confidently resolved for that row (an already-standardized `country` column on the same row, or an organization-configured default country for that data source) — without a resolvable country, a phone number is left unchanged rather than guessed, since E.164 without a country is not deterministically derivable. This is a new pinned dependency (the one trade-off in this section worth calling out explicitly: hand-rolling international phone formatting correctly is not realistically achievable and would either be wrong or so narrow as to be useless — recommended and proceeding with `phonenumbers`).
+- **Postal addresses.** Light-touch only, matching Module 6's own "casing/format normalization... no aggressive rewriting" principle: whitespace, casing (title-case for street lines), and abbreviation expansion/contraction via lookup table (a built-in default table for common English-language address abbreviations — St./Street, Ave./Avenue, Blvd./Boulevard, Apt./Apartment, Ste./Suite — overridable per-entry by organization `standardization_lookup_entries`). No structural parsing into street number/street name/unit components, no USPS CASS-style certification or geocoding — explicitly out of scope (Section 11).
+- **Cities.** Whitespace + casing (title-case) only. No canonical-city-name lookup or misspelling correction — that requires a reference dataset and judgment calls this module deliberately does not make; explicitly out of scope.
+- **States / Provinces.** Normalized to a standard abbreviation via built-in static per-country lookup tables (US states, Canadian provinces at launch — extensible by adding more static tables, not by inventing a new mechanism) — **only applied when a country is resolvable for that row** (an already-standardized `country` column on the same row, or an org-configured default country), to avoid exactly the kind of collision a real reference case creates ("GA" is both a US state abbreviation and, unrelated, an unresolved ambiguity if the country isn't known to be the US). Without a resolvable country, left untouched.
+- **Countries (ISO codes where appropriate).** Normalized to ISO 3166-1 alpha-2 via a built-in static lookup table of common name variants ("USA," "U.S.A.," "United States," "US" → `US`), overridable/extensible by organization `standardization_lookup_entries` (field_type=`country`). Unrecognized values are left untouched, never guessed.
+- **Postal / ZIP codes.** Country-aware format normalization (US: 5-digit or ZIP+4, non-digit characters stripped; Canadian: upper-case single-space `A1A 1A1` format) when a country is resolvable on that row by the same rule as States/Provinces above; otherwise whitespace/casing normalization only, no format assertion.
+- **Dates.** Canonical internal representation is ISO-8601 (reusing the same parsing approach Module 6's `_coerce_date` already established, applied here as Module 7's own pure function rather than importing Module 6's — Module 6's coercion is scoped to "already-profiled `inferred_type` columns," Module 7's is scoped to the `date`/`datetime` field-type classification, a related but distinct concept not worth conflating via a cross-module import). Organization-configurable *output display* format (e.g. `MM/DD/YYYY`) may be layered on top of the canonical ISO value; default output format is ISO-8601 if unconfigured.
+- **Times.** Canonical internal representation is ISO-8601 time (`HH:MM:SS`, 24-hour), same reparse-and-reformat approach as Dates; unparseable values left untouched.
+- **Boolean values.** Canonical internal representation is `"true"`/`"false"` (consistent with Module 6's own boolean coercion, in case a column reaches Module 7 without having gone through that specific Module 6 rule). Organization-configurable *output display* form (e.g. `Yes`/`No`, `1`/`0`) may be layered on top; default output is `"true"`/`"false"` if unconfigured.
+- **Numeric formats.** Canonicalizes decimal separator and removes thousands separators to a plain machine-readable numeric string (`"1,234.56"` → `"1234.56"`). Ambiguous inputs (e.g. `"1.234"` alone, which is a different number under US-vs-European convention) are resolved by an organization-configured numeric locale default for that data source; without one, the international/US convention (comma=thousands, dot=decimal) is assumed only when unambiguous, and left untouched when genuinely ambiguous — never guessed.
+- **Currency formats.** Symbol/code normalized to ISO 4217 via a built-in static table for unambiguous symbols (`€`→`EUR`, `£`→`GBP`, `¥`→`JPY`); the ambiguous `$` resolves via an organization-configured default currency for that data source (since `$` alone doesn't determine USD vs. CAD vs. AUD etc.), left untouched if unconfigured. Numeric portion normalized by the Numeric Formats rule above. Canonical output form: `"<amount> <ISO4217code>"`.
+- **Common abbreviations.** A general-purpose pass (distinct from the address-specific one above) driven entirely by `standardization_lookup_entries` with `field_type=NULL` (applies across any classified text field) — no built-in default table for this generic case, since "common" is context- and org-specific; an org that wants this configures it via the lookup-entries API.
+- **Letter casing / Whitespace normalization.** Not standalone field types — casing and whitespace are applied as part of every other rule above (each field type's description states its casing rule; whitespace trim/collapse is applied first, universally, for every classified column, via the reused `trim_whitespace`).
+- **Configurable lookup tables.** Not a standalone rule but the mechanism (`standardization_lookup_entries`) every lookup-driven rule above (`company_name` suffixes, postal-address abbreviations, `country`, generic abbreviations) already consults, with organization entries always taking precedence over built-in defaults for the same key.
+
+## 7. Audit Model
+
+Two append-only records, directly mirroring Module 6's audit model (Section 11 of `docs/module-6-data-cleaning-engine-design.md`) field-for-field, renamed to this module's domain:
+
+- `StandardizationRun` — one per `STANDARDIZE` `TaskRun`, same one-row-per-run idempotency pattern as `CleaningRun`/`DataProfile`.
+- `StandardizationChange` — many per run: `row_index`, `column_name`, `field_type`, `original_value`, `standardized_value`, `rule_name`, `reason`, `confidence_score`, `created_at` (the timestamp). This is a direct, complete match to the six fields the acceptance criteria require per transformation (original value, standardized value, rule applied, confidence, reason, timestamp) — no additional fields needed, one new field-type column added for the reason given in Section 3. Never updated or deleted, including after rollback — the record of what was attempted and why persists regardless of what happens to its approval state, identical to `CleaningChange`'s guarantee.
+
+Both follow the same tenant-scoping convention every table since Module 3 uses: `organization_id` on every row, composite FK to the parent scoped by organization, no new isolation model introduced.
+
+## 8. Rollback Strategy
+
+Identical mechanism and guarantees to Module 6's (Section 12 of the Module 6 design), reused pattern-for-pattern: rollback is a status transition (`approved → rolled_back`), never a destructive operation, made possible by the same structural fact — the Module 6 output file being standardized is never opened for writing, and the standardized output lives at a third, separate tenant-scoped location (`CSV_STANDARDIZED_ROOT`) from day one. Rolling back sets `StandardizationRun.status = rolled_back` and records who/when; every `StandardizationChange` row is untouched, so a rolled-back run's history remains fully inspectable. The underlying output file is not deleted automatically, matching Module 6's same deferred-retention-policy stance. Rollback is whole-run only in this release, same scope limit as Module 6. Approval state machine: `pending_review → approved`/`rejected`; only an `approved` run can later be `rolled_back`; every transition records the acting user and timestamp; `409 Conflict` on any other starting status — the exact same three-endpoint mechanism, reused, not reinvented.
+
+## 9. Performance Considerations
+
+- Reuses Module 5's existing row/column/cell-size bounds as-is (via the same `CsvLimits`/`load_csv`) — no new ceiling to define.
+- Rule evaluation is the same order of magnitude as Module 6's cleaning pass (`rows × columns`, small constant per rule per classified column) — a third pass over data already read twice (profile, clean), not a new performance class, and unclassified columns cost only the classification check, not a wasted rule evaluation.
+- `StandardizationChange` persistence is explicitly capped (a new setting, `STANDARDIZATION_MAX_PERSISTED_CHANGES`, default `10,000`, mirroring `CLEANING_MAX_PERSISTED_CHANGES`) with an always-accurate aggregate `total_changes_count` and `changes_by_rule` breakdown — the same bounded-but-never-silent pattern established twice already.
+- Lookup-table consultation (`standardization_lookup_entries`) is read once per run (loaded into an in-memory dict keyed by `(field_type, lookup_key)` before the row loop begins), not re-queried per cell — a straightforward, necessary bound given the row×column iteration this rule engine already does, not a new architectural concept.
+- `phonenumbers`' metadata tables are loaded once per process (the library's own standard behavior), not per row.
+- Inherits Module 4's existing, already-documented property that a running handler cannot be preemptively cancelled mid-execution — not a regression Module 7 introduces, not something this module attempts to fix.
+
+## 10. Security Considerations
+
+- **Tenant isolation** is enforced the same way Module 5's B1 fix and Module 6 both establish: standardization output is written under a per-organization output root, never a shared one; every new table and endpoint follows the existing composite-FK tenant-scoping pattern; `standardization_column_mappings`/`standardization_lookup_entries` are both `organization_id`-scoped and read only within that scope, so one organization's column-mapping or abbreviation configuration can never affect another's data.
+- **Auth**: every new endpoint sits behind the same `get_current_active_user` dependency every existing endpoint uses. No new authentication or authorization mechanism.
+- **No new credential surface.** `StandardizationHandler` receives the same `ExecutionContext` as every handler; it does not touch `CredentialProvider` or `DataSourceCredential` at all, matching `CleaningHandler`'s and `CsvProfilingHandler`'s existing scope.
+- **Configuration input validation.** `standardization_column_mappings.field_type` is validated against the fixed field-type registry (Section 6) at the Pydantic layer — an organization cannot inject an arbitrary/unknown field type that would fail to match any rule and silently do nothing (Pydantic rejects it outright, a `422`, not a silent no-op). `standardization_lookup_entries.lookup_key`/`lookup_value` are free-text but bounded in length and pass through `app.core.validation.normalize_name` (trim) the same as every other user-supplied name field in this project; since these are configuration values (not `connection_metadata`), the secret-key denylist (`find_secret_like_key`) does not apply here the way it does to `DataSource.connection_metadata` — there is no free-form JSON key/value structure in these tables for a secret to hide inside, only flat string columns.
+- **File safety.** Output writing reuses the same bounded, safe I/O discipline as Modules 5 and 6 (no unbounded writes; the output path is server-derived from `organization_id` and an internally-generated run identifier, never from client-supplied input).
+- **No AI, no ML, no external network calls.** Every rule is a pure function or a static/organization-configured lookup table; `phonenumbers` is an offline metadata library with no network dependency. This is a hard architectural constraint, not a preference — verified in the production review by grepping the new package for any HTTP client, model-loading, or non-deterministic (`random`, wall-clock-dependent) code path.
+
+## 11. Acceptance Criteria
+
+- [ ] Full test suite green (existing 199 plus all new Module 7 tests).
+- [ ] SQLite migration cycle clean; real PostgreSQL upgrade → downgrade → upgrade clean (including the `ALTER TYPE ... ADD VALUE` autocommit-block behavior specifically verified against real Postgres, since this is the first migration of its kind in this project); exactly one Alembic head confirmed before merge.
+- [ ] Automated proof (not just a design claim) that the Module 6 output file being standardized is byte-identical before and after any standardization run.
+- [ ] Every recorded `StandardizationChange` has a non-null `field_type`, `rule_name`, `reason`, and `confidence_score`.
+- [ ] Standardization is deterministic: the same input file, the same rule set, and the same organization configuration must always produce identical standardized output, audit records, and confidence values (same clause Module 6's acceptance criteria added, extended to also cover organization configuration as a determinism input, since Module 7 — unlike Module 6 — has one).
+- [ ] `StandardizationHandler` refuses to run against a `CleaningRun` that is not `status=approved`, verified by an explicit test for each of the other three statuses.
+- [ ] Rollback tested end-to-end and confirmed non-destructive.
+- [ ] Tenant isolation proven on every new endpoint, on the handler's file/DB access, and on both new organization-configuration tables (one org's mappings/lookup entries never visible to or usable by another), to the same standard as the B1/B2 fixes.
+- [ ] Zero changes to any existing API endpoint's contract beyond the documented `TaskRunCreate` extension; zero changes to Modules 1–6 beyond the `TaskType.STANDARDIZE` enum addition and the one registry-entry addition.
+- [ ] No AI/ML/network dependency anywhere in `app/standardization/` — verified explicitly in the production review, not just asserted in this document.
+- [ ] Not merged into `main` until reviewed and approved.
+
+## 12. Testing Strategy
+
+**Unit (pure, no DB, no client):** every field-type rule tested in isolation for conforming input, already-standardized input (no-op), and representative edge cases per field type (mirroring the breadth of `test_cleaning_rules.py`, scaled to seventeen field types instead of four); the classification/heuristic logic specifically, including the "ambiguous header → unclassified, never guessed" behavior; country-dependent rules (states/provinces, postal codes, phone E.164) tested both with and without a resolvable country to prove the "leave untouched when ambiguous" guarantee; lookup-table precedence (organization entry overriding a built-in default for the same key); confidence aggregation including the zero-changes case; the persisted-changes cap; engine-level determinism (same input + same rules + same org configuration → identical output across repeated runs), mirroring `test_cleaning_engine.py`'s determinism test exactly.
+
+**Integration:** full handler execution against real fixture files under the existing tenant-scoped directory convention, including idempotency across retries (same proof pattern as Modules 5 and 6); an explicit test that `StandardizationHandler` rejects a source `CleaningRun` in each of `pending_review`/`rejected`/`rolled_back` status with a permanent failure; tenant isolation on every new endpoint, on file access, and on both configuration tables (same proof shape as B1/B2 and Module 6's own isolation tests); the full approval state machine including invalid-transition `409`s; an explicit, automated assertion that the Module 6 output file's hash is unchanged after a standardization run; the existing full test suite re-run to confirm zero regressions; the standing SQLite and real-PostgreSQL migration-cycle verification (with particular attention to the `ALTER TYPE ADD VALUE` migration, run against real PostgreSQL specifically since SQLite cannot exercise this code path at all), plus a single-head check before merge.
+
+## 13. Implementation Plan
+
+Following this project's established incremental workflow (Implementation → Unit Tests → Integration Tests → SQLite Verification → PostgreSQL Verification → Production Review → Merge Recommendation), once this design is approved:
+
+1. **Core code:** `app/standardization/` package (`types.py`, `engine.py`, `rules/` per field-type family), `StandardizationRun`/`StandardizationChange` models, `StandardizationColumnMapping`/`StandardizationLookupEntry` models, `StandardizationHandler`, registry update, config settings (`CSV_STANDARDIZED_ROOT`, `STANDARDIZATION_MAX_PERSISTED_CHANGES`), the `TaskType.STANDARDIZE` enum addition, the hand-written Alembic migration (including the autocommit-block `ALTER TYPE` handling).
+2. **API endpoints:** `TaskRunCreate` validation extension, the five standardization run/changes/approve/reject/rollback endpoints, the two configuration-table CRUD endpoint sets.
+3. **Unit tests:** every field-type rule, the classification heuristic, the engine's determinism/ordering/aggregation/cap behavior.
+4. **Integration tests:** handler execution, idempotency, source-CleaningRun-status gating, tenant isolation (including the two new configuration tables), source-file-hash-unchanged proof, the full approval state machine.
+5. **SQLite verification:** full suite plus `base → head → base → head` migration cycle.
+6. **Real PostgreSQL verification** (run by the project owner outside the sandbox, same handoff as every prior module): migration cycle with specific attention to `ALTER TYPE ... ADD VALUE`, full suite.
+7. **Production review** against the same ten-dimension checklist used for every prior module.
+8. **`PROJECT_CONTEXT.md` updated**, then merge recommendation — contingent on real-PostgreSQL verification passing, matching the established pattern from every prior module.
+
+No code, no migrations, no database models, no API endpoints, and no tests have been generated. This is the design only, waiting on approval before implementation begins.
+
+---
+
+FINAL DESIGN STATUS:
+READY FOR REVIEW
