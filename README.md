@@ -504,12 +504,36 @@ succeeding as a no-op. `TRANSFORM`, `EXPORT`, and `OTHER` are unaffected.
 
 **Loading.** `app/profiling/csv_loader.py` reads a CSV strictly read-only,
 bounded by `CSV_MAX_FILE_SIZE_BYTES` / `CSV_MAX_ROWS` / `CSV_MAX_COLUMNS` /
-`CSV_MAX_CELL_LENGTH`. `DataSource.connection_metadata.file_path` is always
-resolved relative to `CSV_INPUT_ROOT` (`resolve_source_path`) — an absolute
-path or any path that escapes that root is rejected outright, not sandboxed.
-Encoding is detected (UTF-8, with a UTF-8 BOM check) and hashed (SHA-256 of
-the raw bytes) before parsing; malformed rows are recorded as structural
-issues rather than silently dropped or crashing the load.
+`CSV_MAX_CELL_LENGTH`. `DataSource.connection_metadata.file_path` is never
+resolved against the shared `CSV_INPUT_ROOT` directly -- it is resolved
+against that organization's own subdirectory,
+`CSV_INPUT_ROOT/{organization_id}/` (`CsvProfilingHandler.execute` builds
+this tenant root from `data_source.organization_id` before calling
+`resolve_source_path`). This is a hard tenant-isolation boundary, not just
+traversal protection: `resolve_source_path`'s existing absolute-path
+rejection and `../`-escape check still apply unchanged, but they now bound
+each org to its own slice of the filesystem, not the whole shared root --
+one organization's `file_path` can never resolve to a file under a
+different organization's directory, even if the filename is known or
+guessed. CSV files must therefore be laid out per organization:
+
+```
+CSV_INPUT_ROOT/
+  {organization_id}/
+    customer-file.csv
+  {another_organization_id}/
+    their-file.csv
+```
+
+A `DataSource.connection_metadata.file_path` of `"customer-file.csv"`
+belonging to `{organization_id}` resolves to
+`CSV_INPUT_ROOT/{organization_id}/customer-file.csv` and nowhere else --
+placing a file outside its matching organization's directory makes it
+unreachable for that org, and placing it under a *different* org's
+directory does not make it reachable by the first org, by design. Encoding
+is detected (UTF-8, with a UTF-8 BOM check) and hashed (SHA-256 of the raw
+bytes) before parsing; malformed rows are recorded as structural issues
+rather than silently dropped or crashing the load.
 
 **Profiling.** `app/profiling/csv_profiler.py` is a pure function: given a
 loaded CSV and the same limits, it deterministically computes row/column
@@ -574,7 +598,7 @@ See `.env.example` for the full list. Key variables:
 | `WORKER_DEFAULT_MAX_ATTEMPTS` | Default max retry attempts (default `3`) |
 | `WORKER_RETRY_BASE_DELAY_SECONDS` / `WORKER_RETRY_MAX_DELAY_SECONDS` | Exponential backoff base/cap (default `30` / `900`) |
 | `REAPER_POLL_INTERVAL_SECONDS` | How often the reaper scans for expired leases (default `15`) |
-| `CSV_INPUT_ROOT` | Server-controlled root all CSV `file_path`s resolve against (default `./data/csv`) |
+| `CSV_INPUT_ROOT` | Server-controlled root; each org is confined to `CSV_INPUT_ROOT/{organization_id}/` (default `./data/csv`) |
 | `CSV_MAX_FILE_SIZE_BYTES` | Max CSV size read into memory (default `26214400`, 25 MB) |
 | `CSV_MAX_ROWS` / `CSV_MAX_COLUMNS` / `CSV_MAX_CELL_LENGTH` | Bounds enforced during load (defaults `100000` / `500` / `100000`) |
 | `CSV_MAX_DISTINCT_VALUES` / `CSV_MAX_SAMPLE_VALUES` | Per-column bounds on retained distinct/sample values in a profile (defaults `100` / `10`) |

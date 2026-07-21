@@ -60,7 +60,17 @@ class CsvProfilingHandler:
 
         settings = get_settings()
         try:
-            path = resolve_source_path(Path(settings.csv_input_root), configured_path)
+            # Tenant isolation: every organization is confined to its own
+            # subdirectory of CSV_INPUT_ROOT (CSV_INPUT_ROOT/{organization_id}/),
+            # not the shared root. Without this, resolve_source_path's
+            # traversal-escape check alone would still let any org's
+            # file_path reference any file under the shared root -- it only
+            # ever guaranteed a path couldn't leave CSV_INPUT_ROOT, never
+            # that it couldn't leave the CALLING org's slice of it. Scoping
+            # the root itself to the data source's organization_id closes
+            # that gap while reusing the exact same escape check unchanged.
+            tenant_root = Path(settings.csv_input_root) / str(data_source.organization_id)
+            path = resolve_source_path(tenant_root, configured_path)
             limits = self._limits()
             result = profile_csv(load_csv(path, limits), limits)
         except CsvLoadError as exc:

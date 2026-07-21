@@ -84,14 +84,17 @@ def test_csv_handler_persists_one_profile_across_retries(
 ) -> None:
     csv_root = tmp_path / "csv"
     csv_root.mkdir()
-    (csv_root / "customers.csv").write_text(
-        "id,name\n1,Ada\n2,Grace\n2,Grace\n",
-        encoding="utf-8",
-    )
     monkeypatch.setenv("CSV_INPUT_ROOT", str(csv_root))
     get_settings.cache_clear()
     try:
         context = _make_context(client, db_session, "customers.csv")
+        # File lives under the calling org's own subdirectory -- see B1.
+        org_dir = csv_root / str(context.data_source.organization_id)
+        org_dir.mkdir(parents=True)
+        (org_dir / "customers.csv").write_text(
+            "id,name\n1,Ada\n2,Grace\n2,Grace\n",
+            encoding="utf-8",
+        )
         handler = CsvProfilingHandler()
 
         first = handler.execute(context)
@@ -134,6 +137,115 @@ def test_csv_handler_rejects_missing_file(
     try:
         context = _make_context(client, db_session, "missing.csv")
         with pytest.raises(PermanentExecutionError, match="not found"):
+            CsvProfilingHandler().execute(context)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_csv_handler_reads_file_within_own_organization_directory(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """B1: CSV_INPUT_ROOT/{organization_id}/... is the resolved root, not the
+    shared CSV_INPUT_ROOT itself -- a file placed under the calling org's own
+    directory is readable."""
+    csv_root = tmp_path / "csv"
+    csv_root.mkdir()
+    monkeypatch.setenv("CSV_INPUT_ROOT", str(csv_root))
+    get_settings.cache_clear()
+    try:
+        context = _make_context(client, db_session, "customers.csv")
+        org_dir = csv_root / str(context.data_source.organization_id)
+        org_dir.mkdir(parents=True)
+        (org_dir / "customers.csv").write_text("id,name\n1,Ada\n", encoding="utf-8")
+
+        result = CsvProfilingHandler().execute(context)
+
+        assert "csv profile created" in result
+    finally:
+        get_settings.cache_clear()
+
+
+def test_csv_handler_cannot_read_file_belonging_to_another_organization(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """B1: a file that physically exists under a DIFFERENT organization's
+    directory must be unreachable, even though the relative file_path is
+    identical and the file is present on disk -- proves isolation is by
+    organization_id, not merely by filename."""
+    csv_root = tmp_path / "csv"
+    csv_root.mkdir()
+    monkeypatch.setenv("CSV_INPUT_ROOT", str(csv_root))
+    get_settings.cache_clear()
+    try:
+        victim_context = _make_context(client, db_session, "shared.csv")
+        victim_org_dir = csv_root / str(victim_context.data_source.organization_id)
+        victim_org_dir.mkdir(parents=True)
+        (victim_org_dir / "shared.csv").write_text("id,name\n1,Victim\n", encoding="utf-8")
+
+        attacker_context = _make_context(client, db_session, "shared.csv")
+        assert (
+            attacker_context.data_source.organization_id
+            != victim_context.data_source.organization_id
+        )
+
+        with pytest.raises(PermanentExecutionError, match="not found"):
+            CsvProfilingHandler().execute(attacker_context)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_csv_handler_blocks_parent_directory_traversal_out_of_tenant_root(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """B1 + pre-existing traversal protection: ../ cannot be used to escape
+    the calling org's own subdirectory, including to reach a sibling org's
+    directory or the shared root."""
+    csv_root = tmp_path / "csv"
+    csv_root.mkdir()
+    monkeypatch.setenv("CSV_INPUT_ROOT", str(csv_root))
+    get_settings.cache_clear()
+    try:
+        victim_context = _make_context(client, db_session, "shared.csv")
+        victim_org_dir = csv_root / str(victim_context.data_source.organization_id)
+        victim_org_dir.mkdir(parents=True)
+        (victim_org_dir / "shared.csv").write_text("id,name\n1,Victim\n", encoding="utf-8")
+
+        traversal_path = f"../{victim_context.data_source.organization_id}/shared.csv"
+        attacker_context = _make_context(client, db_session, traversal_path)
+
+        with pytest.raises(PermanentExecutionError, match="escapes"):
+            CsvProfilingHandler().execute(attacker_context)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_csv_handler_blocks_absolute_path_escape(
+    client: TestClient,
+    db_session,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """B1 + pre-existing traversal protection: an absolute file_path is
+    rejected outright, regardless of tenant scoping."""
+    csv_root = tmp_path / "csv"
+    csv_root.mkdir()
+    outside = tmp_path / "outside.csv"
+    outside.write_text("id,name\n1,Outside\n", encoding="utf-8")
+    monkeypatch.setenv("CSV_INPUT_ROOT", str(csv_root))
+    get_settings.cache_clear()
+    try:
+        context = _make_context(client, db_session, str(outside))
+
+        with pytest.raises(PermanentExecutionError, match="Absolute"):
             CsvProfilingHandler().execute(context)
     finally:
         get_settings.cache_clear()
