@@ -106,6 +106,17 @@ class TaskRun(Base):
         # pattern as every other Module 3/4 parent table.
         UniqueConstraint("organization_id", "id", name="uq_task_runs_org_id"),
         UniqueConstraint("idempotency_key", name="uq_task_runs_idempotency_key"),
+        # Module 6: self-referential, nullable -- only meaningful for
+        # TRANSFORM runs, identifying which prior SYNC run's DataProfile
+        # this run cleans. NULL for every other task type and every
+        # pre-Module-6 row. See docs/module-6-data-cleaning-engine-
+        # design.md Section 15.
+        ForeignKeyConstraint(
+            ["organization_id", "source_task_run_id"],
+            ["task_runs.organization_id", "task_runs.id"],
+            name="fk_task_runs_org_source_task_run",
+            ondelete="RESTRICT",
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid(), primary_key=True, default=uuid.uuid4)
@@ -149,6 +160,10 @@ class TaskRun(Base):
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # --- Module 6: only meaningful for TRANSFORM runs (see __table_args__
+    # above) ---
+    source_task_run_id: Mapped[uuid.UUID | None] = mapped_column(Uuid(), nullable=True)
 
     task: Mapped["Task"] = relationship(back_populates="runs")  # noqa: F821
     events: Mapped[list["TaskRunEvent"]] = relationship(  # noqa: F821

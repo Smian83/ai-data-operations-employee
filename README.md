@@ -46,12 +46,17 @@ ai-data-operations-employee/
 │   │   │   └── session.py        # Engine / session factory
 │   │   ├── models/                # organization, user, data_source, task,
 │   │   │                          # task_run, task_run_event, data_source_credential,
-│   │   │                          # data_profile (Module 5), enums
+│   │   │                          # data_profile (Module 5), cleaning_run,
+│   │   │                          # cleaning_change (Module 6), enums
 │   │   ├── schemas/               # Pydantic request/response schemas
 │   │   ├── profiling/             # Module 5: pure CSV loading + profiling logic
 │   │   │   ├── csv_loader.py      # bounded, read-only, path-traversal-safe
 │   │   │   ├── csv_profiler.py    # deterministic, pure quality-metric calculation
 │   │   │   └── types.py           # CsvLimits / LoadedCsv / ProfileResult
+│   │   ├── cleaning/               # Module 6: pure deterministic cleaning rule engine
+│   │   │   ├── rules.py            # trim/blank-normalize/type-coerce, pure functions
+│   │   │   ├── engine.py           # clean() orchestration; CLEANING_ENGINE_VERSION
+│   │   │   └── types.py            # CleaningLimits / Change / CleaningResult
 │   │   └── worker/                # Module 4: task execution engine
 │   │       ├── engine.py          # claim/heartbeat/complete (lease_token fencing)
 │   │       ├── reaper.py          # stuck-run recovery (expired leases)
@@ -59,7 +64,8 @@ ai-data-operations-employee/
 │   │       ├── metrics.py         # Prometheus counters/gauges/histogram
 │   │       ├── runner.py          # worker process main loop
 │   │       └── handlers/          # ExecutionHandler registry (SYNC -> CSV
-│   │                              # profiling as of Module 5; others no-op)
+│   │                              # profiling as of Module 5; TRANSFORM ->
+│   │                              # CleaningHandler as of Module 6; others no-op)
 │   ├── requirements.txt          # Production dependencies (pinned)
 │   └── requirements-dev.txt      # + testing dependencies
 ├── frontend/                     # Reserved for a future module
@@ -69,7 +75,8 @@ ai-data-operations-employee/
 │       ├── env.py
 │       └── versions/              # organizations+users, data_sources+tasks+task_runs,
 │       │                          # task execution engine (Module 4),
-│       │                          # data ingestion & profiling (Module 5)
+│       │                          # data ingestion & profiling (Module 5),
+│       │                          # data cleaning engine (Module 6)
 ├── docker/
 │   ├── Dockerfile                # Multi-stage production image
 │   └── .dockerignore
@@ -89,7 +96,12 @@ ai-data-operations-employee/
 │   ├── test_worker_api.py
 │   ├── test_csv_loader.py
 │   ├── test_csv_profiler.py
-│   └── test_csv_profiling_handler.py
+│   ├── test_csv_profiling_handler.py
+│   ├── test_task_run_profile_api.py
+│   ├── test_cleaning_rules.py
+│   ├── test_cleaning_engine.py
+│   ├── test_cleaning_handler.py
+│   └── test_cleaning_api.py
 ├── scripts/
 │   └── wait_for_postgres.py      # Startup dependency check
 ├── pytest.ini
@@ -566,6 +578,87 @@ type reaches an 80% majority) and not configurable per column. Files are
 read entirely into memory up to `CSV_MAX_FILE_SIZE_BYTES` (25 MB default) —
 true streaming for larger files is not implemented.
 
+## Data Cleaning Engine (Module 6)
+
+The second real execution handler: `TaskType.TRANSFORM` now maps to
+`CleaningHandler` instead of the Module 4 no-op (`SYNC`, `EXPORT`, and
+`OTHER` are unaffected). A `TRANSFORM` `TaskRun` cleans the CSV already
+profiled by a prior `SYNC` run -- it never invents its own input, and it
+never writes to the source file.
+
+**Requesting a cleaning run.** `POST /tasks/{id}/runs` accepts an optional
+JSON body, `{"source_task_run_id": "<uuid>"}`. Omitting the body entirely
+behaves exactly as before Module 6 (unaffected for `SYNC`/`EXPORT`/`OTHER`
+tasks). For a `TRANSFORM` task the field is required -- it identifies which
+prior `SYNC` run's `DataProfile` to clean -- and must reference a TaskRun
+in the caller's own organization (`400` if missing, `404` if not found or
+cross-org). Supplying it for a non-`TRANSFORM` task is rejected (`400`).
+
+**Cleaning pipeline.** `app/cleaning/rules.py` and `app/cleaning/engine.py`
+are pure, deterministic functions -- no I/O, no randomness -- applied in a
+fixed order per cell: trim/collapse whitespace, normalize blank-equivalent
+values (`"N/A"`, `"-"`, `"null"`, `"none"`, ...) to the empty string, then
+coerce non-conforming values toward the column's `DataProfile`-reported
+`inferred_type` (integer/decimal/boolean/date/datetime). Order matters --
+later rules depend on earlier ones having already normalized their input.
+Duplicate rows are flagged (via the same normalized-tuple comparison
+`csv_profiler` already uses) but never auto-removed. Every applied change
+carries a fixed, rule-specific confidence value; a run's overall
+`confidence_score` is the *minimum* across its applied changes, not an
+average, so one uncertain change pulls the reported confidence down rather
+than being diluted by many trivial ones. `CLEANING_ENGINE_VERSION` (`"1.0"`)
+is recorded on every `CleaningRun` so a future rule-set change never
+leaves an existing run's provenance ambiguous.
+
+**Output.** `CleaningHandler` re-reads the exact source file
+`CsvProfilingHandler` already profiled (same tenant-scoped
+`CSV_INPUT_ROOT/{organization_id}/` path) and writes the cleaned CSV to a
+*separate*, also tenant-scoped root, `CSV_OUTPUT_ROOT/{organization_id}/`
+-- the source file is never opened for writing anywhere in this module.
+The cleaned output is hashed (SHA-256) and re-profiled via the existing,
+unchanged `profile_csv`, giving a concrete before/after quality comparison
+(row count, missing-value total, duplicate count) alongside the change log.
+
+**Persistence and idempotency.** One immutable `CleaningRun` row per
+cleaning `TaskRun` (`uq_cleaning_runs_task_run_id`), plus a bounded set of
+per-cell `CleaningChange` rows (capped at `CLEANING_MAX_PERSISTED_CHANGES`,
+default `10,000`) -- `CleaningRun.total_changes_count` and
+`changes_by_rule` are always the true totals even when the individual rows
+are capped, so nothing is silently lost from the aggregate. Retries are
+idempotent via the same unique-constraint-plus-refetch pattern
+`CsvProfilingHandler` already uses.
+
+**Approval workflow.** Nothing produced by this module is treated as
+authoritative without an explicit human decision. Every `CleaningRun`
+starts `pending_review` and follows a small, fixed state machine:
+
+- `POST /tasks/{id}/runs/{run_id}/cleaning/approve` — `pending_review` -> `approved`
+- `POST /tasks/{id}/runs/{run_id}/cleaning/reject` — `pending_review` -> `rejected`
+- `POST /tasks/{id}/runs/{run_id}/cleaning/rollback` — `approved` -> `rolled_back`
+
+Any other starting status returns `409 Conflict`. Rollback is a pure status
+transition, not a destructive operation: the output file and every
+`CleaningChange` row are left untouched, since the source file was never
+touched in the first place and the cleaned output lives at a separate
+location from day one.
+
+**Reading results.**
+`GET /tasks/{id}/runs/{run_id}/cleaning` returns the run summary (counts,
+confidence, output location/hash, approval status); `404` if the run isn't
+visible to the caller's org or no cleaning result exists yet.
+`GET /tasks/{id}/runs/{run_id}/cleaning/changes` returns the paginated
+per-cell change log, same shape as the Module 4 task-run-events endpoint.
+
+**Known limitations.** CSV only, inherited from Module 5's own scope --
+non-`CSV_UPLOAD` sources fail permanently under `TRANSFORM`, same as
+`SYNC`. AI-assisted correction is explicitly out of scope for this module
+(a defined extension point, not built). Rollback is whole-run only; there
+is no cell-level selective undo. Rolled-back and rejected runs leave their
+output files on disk rather than deleting them, by design -- a storage
+retention policy is deferred, not solved here.
+
+## Health Endpoint
+
 ## Health Endpoint
 
 `GET /health` returns:
@@ -602,6 +695,8 @@ See `.env.example` for the full list. Key variables:
 | `CSV_MAX_FILE_SIZE_BYTES` | Max CSV size read into memory (default `26214400`, 25 MB) |
 | `CSV_MAX_ROWS` / `CSV_MAX_COLUMNS` / `CSV_MAX_CELL_LENGTH` | Bounds enforced during load (defaults `100000` / `500` / `100000`) |
 | `CSV_MAX_DISTINCT_VALUES` / `CSV_MAX_SAMPLE_VALUES` | Per-column bounds on retained distinct/sample values in a profile (defaults `100` / `10`) |
+| `CSV_OUTPUT_ROOT` | Server-controlled root for cleaned CSV output; each org confined to `CSV_OUTPUT_ROOT/{organization_id}/`, always distinct from `CSV_INPUT_ROOT` (default `./data/csv_cleaned`) |
+| `CLEANING_MAX_PERSISTED_CHANGES` | Max `CleaningChange` rows persisted per cleaning run; the aggregate `total_changes_count` on `CleaningRun` is always accurate even when capped (default `10000`) |
 
 ## License
 
