@@ -141,9 +141,6 @@ def upgrade() -> None:
             server_default=sa.func.now(), nullable=False,
         ),
         sa.PrimaryKeyConstraint("id", name="pk_data_source_credentials"),
-        sa.UniqueConstraint(
-            "data_source_id", name="uq_data_source_credentials_data_source_id"
-        ),
         sa.ForeignKeyConstraint(
             ["organization_id"], ["organizations.id"],
             name="fk_data_source_credentials_organization_id_organizations",
@@ -158,6 +155,22 @@ def upgrade() -> None:
     op.create_index(
         "ix_data_source_credentials_organization_id", "data_source_credentials", ["organization_id"]
     )
+    # This single unique index is the ENTIRE uniqueness contract for
+    # data_source_id -- deliberately not also declared as a table-level
+    # UniqueConstraint. That would create a second, redundant unique object
+    # covering the identical column and diverge from the model's actual DDL
+    # contract: DataSourceCredential.data_source_id is declared with
+    # `unique=True, index=True` (no separate `unique=True`-only column),
+    # which per SQLAlchemy's Column semantics compiles to exactly one
+    # unique Index -- never a UniqueConstraint -- confirmed by compiling
+    # CreateTable(DataSourceCredential.__table__) against the postgresql
+    # dialect directly. An earlier draft of this migration additionally
+    # declared `sa.UniqueConstraint(..., name="uq_data_source_credentials_
+    # data_source_id")` here, which created a second unique-enforcing
+    # object the model never asked for -- the same class of migration/model
+    # DDL-ownership drift as the Module 3 enum bug, just on a constraint
+    # instead of a type. Removed; do not re-add without also adding the
+    # matching UniqueConstraint (and a corresponding drop) to the model.
     op.create_index(
         "ix_data_source_credentials_data_source_id", "data_source_credentials", ["data_source_id"],
         unique=True,
