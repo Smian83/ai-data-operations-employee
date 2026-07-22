@@ -39,6 +39,22 @@ and Dataset Name search joins are applied exactly once, against the
 already-unioned subquery, and only when a search term is supplied. This
 satisfies the design's "every join documented and justified, no
 gratuitous joins" requirement more strictly than joining per branch would.
+
+Post-approval required fixes (production review, does not change the
+approved architecture or contract):
+
+1. Deterministic sort tie-breaking: `reference_id ASC` is now applied as
+   a secondary key after `created_at` and after `confidence_score`
+   (NULLs-last) -- ties are possible on both (PostgreSQL's `now()` is the
+   *transaction* timestamp, so rows written in the same transaction can
+   share an identical `created_at`; equal scores are also plausible).
+   Without a stable secondary key, LIMIT/OFFSET pagination across a tie
+   is not guaranteed to be stable. Applied inside the database query,
+   before LIMIT/OFFSET -- never a Python-side sort.
+2. Whitespace-only search normalization: a `search` value that is empty
+   after `.strip()` (`""`, `" "`, `"   "`) is now treated identically to
+   no search parameter at all, rather than silently becoming a
+   `LIKE '%%'` match-everything predicate.
 """
 from __future__ import annotations
 
@@ -266,12 +282,18 @@ class ReviewQueuePage:
     summary: dict
 
 
-def _apply_filters(rq, filters: ReviewQueueFilters, session: Session):
+def _apply_filters(rq, filters: ReviewQueueFilters):
     """Applies category/type/source/search predicates directly against
     the already-unioned subquery's own columns. The Task Name / Dataset
     Name search join happens exactly once here, against the aggregated
     subquery -- not once per branch (see module docstring, clarification
-    #3) -- and only when a search term is supplied."""
+    #3) -- and only when a non-empty search term is supplied.
+
+    `search` is trimmed exactly once, before any UUID-parsing or text-
+    search branching, so a value that is empty after trimming (`""`,
+    `" "`, `"   "`) is treated identically to no search parameter at all
+    -- no predicate is added, never a `LIKE '%%'` match-everything
+    fallback (post-approval required fix; see module docstring)."""
     conditions = []
     if filters.review_category:
         conditions.append(rq.c.review_category.in_(filters.review_category))
@@ -281,10 +303,10 @@ def _apply_filters(rq, filters: ReviewQueueFilters, session: Session):
         conditions.append(rq.c.source.in_(filters.source))
 
     base = select(rq)
-    if filters.search:
-        term = filters.search.strip()
+    search_term = filters.search.strip() if filters.search else ""
+    if search_term:
         try:
-            term_uuid = uuid.UUID(term)
+            term_uuid = uuid.UUID(search_term)
         except ValueError:
             term_uuid = None
 
@@ -297,7 +319,7 @@ def _apply_filters(rq, filters: ReviewQueueFilters, session: Session):
                 (rq.c.task_id == term_uuid) | (rq.c.reference_id == term_uuid)
             )
         else:
-            like_term = f"%{term.lower()}%"
+            like_term = f"%{search_term.lower()}%"
             base = base.outerjoin(Task, Task.id == rq.c.task_id).outerjoin(
                 DataSource, DataSource.id == rq.c.data_source_id
             )
@@ -329,15 +351,23 @@ def fetch_review_queue(
     `total` -- never a third query, and never a full materialization of
     the filtered row set."""
     union_subquery = _build_union(organization_id).subquery("rq")
-    filtered = _apply_filters(union_subquery, filters, session)
+    filtered = _apply_filters(union_subquery, filters)
 
+    # reference_id ASC is always the final tiebreaker (post-approval
+    # required fix): created_at can tie within one PostgreSQL transaction
+    # (now() is the transaction timestamp, constant across every statement
+    # in it), and confidence_score can tie across independently-scored
+    # rows. Without a stable secondary key, LIMIT/OFFSET pagination across
+    # a tie is not guaranteed to be stable -- applied here, inside the
+    # database query, before LIMIT/OFFSET; never a Python-side sort.
     if sort == "confidence_score":
         order = (
             case((union_subquery.c.confidence_score.is_(None), 1), else_=0),
             union_subquery.c.confidence_score.asc(),
+            union_subquery.c.reference_id.asc(),
         )
     else:
-        order = (union_subquery.c.created_at.asc(),)
+        order = (union_subquery.c.created_at.asc(), union_subquery.c.reference_id.asc())
 
     page_query = filtered.order_by(*order).limit(limit).offset(offset)
     rows = session.execute(page_query).mappings().all()

@@ -218,3 +218,43 @@ def test_review_queue_pagination_params_via_api(client, db_session, monkeypatch,
     assert body["limit"] == 1
     assert body["offset"] == 0
     assert len(body["items"]) == 1
+
+
+def test_review_queue_item_disappears_after_approval_via_existing_endpoint(client, db_session, monkeypatch, tmp_path):
+    """Post-approval required fix: proves the queue reads authoritative
+    state directly, with no cache or duplicated state of its own. Uses
+    the real, existing Module 6 approval endpoint (POST /tasks/{task_id}/
+    runs/{run_id}/cleaning/approve) exactly as production code would --
+    Module 11 has no write endpoint of its own and none is introduced
+    here."""
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    headers = _auth_headers(client, uuid.uuid4().hex)
+    ids = _build_one_pending_review_cleaning_run(client, db_session, csv_root, headers)
+
+    # 1 & 2: the pending_review run appears in the queue.
+    before = client.get("/review-queue", headers=headers)
+    assert before.status_code == 200
+    before_body = before.json()
+    assert before_body["total"] == 1
+    assert before_body["summary"]["pending_reviews"] == 1
+    assert before_body["items"][0]["source"] == "cleaning_run"
+
+    # 3: approve it through the existing, unmodified Module 6 endpoint --
+    # not a Module 11 endpoint, not a direct DB write in the test.
+    approve_response = client.post(
+        f"/tasks/{ids['clean_task_id']}/runs/{ids['clean_run_id']}/cleaning/approve",
+        headers=headers,
+    )
+    assert approve_response.status_code == 200
+    assert approve_response.json()["status"] == "approved"
+
+    # 4, 5 & 6: the queue reflects the change on the very next read, with
+    # total and summary decreasing correctly -- no separate invalidation
+    # or refresh step exists or is needed.
+    after = client.get("/review-queue", headers=headers)
+    assert after.status_code == 200
+    after_body = after.json()
+    assert after_body["total"] == 0
+    assert after_body["items"] == []
+    assert after_body["summary"]["pending_reviews"] == 0
+    assert after_body["summary"]["total_items"] == 0

@@ -157,24 +157,114 @@ repository-wide grep: the only remaining occurrence of the word
 
 ## 10. Testing summary
 
-23 new tests: 15 unit tests against the pure aggregation module directly
-(`tests/test_review_queue_query.py` — all nine branches' classification,
-cross-org isolation, every filter dimension, both sort modes including
-NULLS-last behavior, pagination correctness, summary/total correctness,
-and the `match_decisions.reason` regression) plus 8 API-level tests
-(`tests/test_review_queue_api.py` — auth required, a real worker-produced
-`pending_review` item surfaced correctly end-to-end, tenant isolation via
-real HTTP requests, `422` on invalid `review_category`/`review_type`/
-`sort`, and pagination query params). All 518 tests (495 baseline + 23
-new) pass on both SQLite and real PostgreSQL 16, with zero changes to any
-existing test file.
+23 new tests at initial implementation: 15 unit tests against the pure
+aggregation module directly (`tests/test_review_queue_query.py` — all
+nine branches' classification, cross-org isolation, every filter
+dimension, both sort modes including NULLS-last behavior, pagination
+correctness, summary/total correctness, and the `match_decisions.reason`
+regression) plus 8 API-level tests (`tests/test_review_queue_api.py` —
+auth required, a real worker-produced `pending_review` item surfaced
+correctly end-to-end, tenant isolation via real HTTP requests, `422` on
+invalid `review_category`/`review_type`/`sort`, and pagination query
+params). See Section 12 for 8 additional tests added during the
+post-approval production review's required fixes (31 Module 11 tests
+total). All 526 tests (495 baseline + 31 Module 11) pass on both SQLite
+and real PostgreSQL 16, with zero changes to any pre-existing test file.
 
 ## 11. Scope confirmation
 
 `git diff main --stat` against this branch shows exactly one modified
-file (`backend/app/main.py`, +2 lines) and six new files (`app/api/
+file (`backend/app/main.py`, +2 lines) and new files under `app/api/
 review_queue.py`, `app/review_queue/__init__.py`, `app/review_queue/
-query.py`, `app/schemas/review_queue.py`, the migration, and two test
-files). No worker, handler, model, or existing schema file was touched.
-No existing test was modified. No existing API endpoint's contract
+query.py`, `app/schemas/review_queue.py`, the migration, two test files,
+and (added during the post-approval fixes, Section 12) a standalone
+`backend/scripts/review_queue_index_evidence/` directory. No worker,
+handler, model, or existing schema file was touched. No pre-existing
+test was modified (only extended with new test functions). No existing
+API endpoint's contract changed.
+
+## 12. Post-approval production review: required fixes
+
+An independent implementation review (Revision 3 architecture unchanged
+throughout) returned "APPROVED AFTER REQUIRED FIXES" and required seven
+fixes, none of which touch the approved API contract, classification
+vocabulary, source mappings, migration architecture, or tenant-isolation
+model. All seven are implemented in `backend/app/review_queue/query.py`
+unless noted otherwise:
+
+1. **Deterministic sort tie-breaking.** Both `ORDER BY` clauses in
+   `fetch_review_queue()` now append `reference_id ASC` as a secondary
+   key — `created_at ASC, reference_id ASC` for the default sort, and
+   `confidence_score ASC NULLS LAST, reference_id ASC` for the
+   score-based sort. This matters because PostgreSQL's `now()` is the
+   *transaction* timestamp (constant across every statement in one
+   transaction), so rows written together can legitimately share an
+   identical `created_at`; without a stable secondary key, LIMIT/OFFSET
+   pagination across such a tie was not guaranteed to be stable. Applied
+   inside the database query, before LIMIT/OFFSET — never a Python-side
+   sort. Regression tests: `test_sort_created_at_tie_is_broken_by_
+   reference_id`, `test_sort_created_at_tie_pagination_has_no_overlap_
+   or_gaps`, `test_sort_confidence_score_tie_is_broken_by_reference_id`
+   (all in `tests/test_review_queue_query.py`, using a dedicated fixture
+   that deliberately gives multiple rows an identical `created_at`/
+   `confidence_score`).
+2. **Whitespace-only search normalization.** `_apply_filters()` now
+   trims `filters.search` exactly once, before any UUID-parsing or
+   text-search branching; a value that is empty after trimming (`""`,
+   `" "`, `"   "`) is treated identically to no search parameter at all
+   — no predicate is added, never the previous accidental
+   `LIKE '%%'` match-everything fallback. Regression test:
+   `test_whitespace_only_search_behaves_as_no_search`.
+3. **Malformed UUID search regression test added**
+   (`test_search_malformed_uuid_falls_back_to_substring_search`) — locks
+   in the pre-existing correct behavior (a `ValueError` from
+   `uuid.UUID(...)` falls back to the Task Name / Dataset Name substring
+   search path) with both a no-match and a genuine-match case, plus a
+   cross-tenant check. No code change was required for this fix; the
+   fallback was already correct, only untested.
+4. **Combined-filter tests added**
+   (`test_combined_review_category_and_source_filter`,
+   `test_combined_review_category_review_type_and_source_filter`) —
+   verify the independent `.in_()` predicates combine with AND semantics
+   as intended, including a cross-tenant check under a combined filter.
+   No code change was required; `_apply_filters()` already ANDs every
+   active condition together.
+5. **End-to-end queue transition test added**
+   (`test_review_queue_item_disappears_after_approval_via_existing_
+   endpoint` in `tests/test_review_queue_api.py`) — builds a real
+   `pending_review` cleaning run, confirms it appears in `GET
+   /review-queue`, approves it through the existing, unmodified
+   `POST /tasks/{task_id}/runs/{run_id}/cleaning/approve` endpoint (no
+   Module 11 write path exists or was added), and confirms the item is
+   gone from the very next `GET /review-queue` call with `total` and
+   `summary.pending_reviews` both correctly decremented. Proves the
+   queue reads authoritative state directly, with no cache or duplicated
+   state of its own.
+6. **Removed the unused `session` parameter from `_apply_filters()`.**
+   It was never referenced in the function body. Its one caller
+   (`fetch_review_queue()`) was updated accordingly. Cleanup only — no
+   behavioral change.
+7. **Preserved the index-evidence scripts** at
+   `backend/scripts/review_queue_index_evidence/` (`README.md`,
+   `seed_representative.py`, `seed_large_scale.py`) — the same
+   methodology described in Section 6 above, sanitized of the original
+   sandbox-specific absolute path (now resolved relative to the script's
+   own file location) and the original hardcoded organization UUID (now
+   looked up by a stable slug, `evidence-org-0`, so the two scripts chain
+   correctly on any fresh disposable database). Never imported by the
+   application or test suite; requires an explicit `DATABASE_URL` and
+   raises immediately if unset, and the README states in its first
+   paragraph never to run either script against a production or shared
+   database. Includes reproducible `EXPLAIN (ANALYZE, BUFFERS)`
+   instructions and a targeted cleanup query (`DELETE FROM organizations
+   WHERE slug LIKE 'evidence-org-%'`, which cascades via the existing
+   tenant-aware foreign keys) as an alternative to discarding the whole
+   disposable database.
+
+Post-fix verification: 526 tests (495 baseline + 31 Module 11) pass on
+both SQLite and real PostgreSQL 16; the Alembic
+`downgrade -1` / `upgrade head` cycle was re-verified against PostgreSQL
+16 after these fixes with all six indexes confirmed present via
+`pg_indexes`; `c5d6e7f8a9b0` remains the single Alembic head; no
+existing approval endpoint, public response field, or query parameter
 changed.

@@ -10,6 +10,8 @@ pass), matching every other test file in this suite."""
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from app.models.artifact_download_event import ArtifactDownloadEvent
 from app.models.cleaning_run import CleaningRun
 from app.models.data_source import DataSource
@@ -364,3 +366,203 @@ def test_summary_total_matches_items_total_field(db_session):
     assert len(page.items) == 2
     assert page.total == 8
     assert page.summary["total_items"] == 8
+
+
+def _seed_tied_timestamp_rows(db_session, org_id: uuid.UUID, count: int):
+    """Post-approval required fix regression fixture: builds `count`
+    CleaningRun items that share the EXACT SAME created_at (and, for the
+    confidence_score sort test, the exact same confidence_score) -- the
+    real-world scenario is rows written within a single PostgreSQL
+    transaction, where now() is the transaction timestamp and is therefore
+    identical across every statement in it. Without a deterministic
+    secondary sort key (reference_id), LIMIT/OFFSET pagination across
+    this tie is not guaranteed to be stable."""
+    tied_created_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
+    org = Organization(id=org_id, name=f"Org {org_id}", slug=f"org-{org_id.hex[:8]}")
+    db_session.add(org)
+    db_session.flush()
+    data_source = DataSource(
+        id=uuid.uuid4(), organization_id=org_id, name="Tie Dataset",
+        source_type="csv_upload", connection_metadata={}, is_active=True,
+    )
+    db_session.add(data_source)
+    task = Task(
+        id=uuid.uuid4(), organization_id=org_id, data_source_id=data_source.id,
+        name="Tie Task", task_type="transform", is_active=True,
+    )
+    db_session.add(task)
+    db_session.flush()
+
+    reference_ids = []
+    for _ in range(count):
+        tr = TaskRun(
+            id=uuid.uuid4(), organization_id=org_id, task_id=task.id, status="success",
+            idempotency_key=uuid.uuid4(), attempt_count=1, created_at=tied_created_at,
+            started_at=tied_created_at, finished_at=tied_created_at,
+        )
+        db_session.add(tr)
+        db_session.flush()
+        run = CleaningRun(
+            **_base_run_kwargs(org_id, task.id, tr.id, data_source.id, tr.id, tied_created_at),
+            row_count=10, total_changes_count=1, changes_by_rule={}, duplicate_row_count=0,
+            post_clean_row_count=10, post_clean_missing_value_total=0,
+            post_clean_duplicate_row_count=0, cleaning_engine_version="1.0",
+        )
+        db_session.add(run)
+        db_session.flush()
+        reference_ids.append(run.id)
+    db_session.commit()
+    return reference_ids
+
+
+def test_sort_created_at_tie_is_broken_by_reference_id(db_session):
+    org_id = uuid.uuid4()
+    reference_ids = _seed_tied_timestamp_rows(db_session, org_id, count=5)
+    expected_order = sorted(reference_ids)
+
+    page = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "created_at", limit=100, offset=0)
+    actual_order = [i["reference_id"] for i in page.items]
+    assert actual_order == expected_order
+
+    # Repeated requests must return the identical ordering.
+    page_again = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "created_at", limit=100, offset=0)
+    assert [i["reference_id"] for i in page_again.items] == actual_order
+
+
+def test_sort_created_at_tie_pagination_has_no_overlap_or_gaps(db_session):
+    org_id = uuid.uuid4()
+    reference_ids = _seed_tied_timestamp_rows(db_session, org_id, count=5)
+    expected_order = sorted(reference_ids)
+
+    page1 = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "created_at", limit=2, offset=0)
+    page2 = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "created_at", limit=2, offset=2)
+    page3 = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "created_at", limit=2, offset=4)
+
+    all_returned = (
+        [i["reference_id"] for i in page1.items]
+        + [i["reference_id"] for i in page2.items]
+        + [i["reference_id"] for i in page3.items]
+    )
+    assert all_returned == expected_order  # no overlap, no skipped items, stable order across pages
+
+
+def test_sort_confidence_score_tie_is_broken_by_reference_id(db_session):
+    org_id = uuid.uuid4()
+    reference_ids = _seed_tied_timestamp_rows(db_session, org_id, count=4)
+    # _base_run_kwargs gives every row the same confidence_score (0.9).
+    expected_order = sorted(reference_ids)
+
+    page = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "confidence_score", limit=100, offset=0)
+    actual_order = [i["reference_id"] for i in page.items]
+    assert actual_order == expected_order
+
+    page_again = fetch_review_queue(db_session, org_id, ReviewQueueFilters(), "confidence_score", limit=100, offset=0)
+    assert [i["reference_id"] for i in page_again.items] == actual_order
+
+
+def test_whitespace_only_search_behaves_as_no_search(db_session):
+    org_id = uuid.uuid4()
+    _seed_full_queue(db_session, org_id)
+    baseline = fetch_review_queue(db_session, org_id, ReviewQueueFilters(search=None), "created_at", limit=100, offset=0)
+
+    for whitespace_value in ("", " ", "   ", "\t"):
+        page = fetch_review_queue(
+            db_session, org_id, ReviewQueueFilters(search=whitespace_value), "created_at", limit=100, offset=0
+        )
+        assert page.total == baseline.total == 8
+        assert page.summary == baseline.summary
+        assert {i["reference_id"] for i in page.items} == {i["reference_id"] for i in baseline.items}
+
+
+def test_search_malformed_uuid_falls_back_to_substring_search(db_session):
+    org_id = uuid.uuid4()
+    _seed_full_queue(db_session, org_id, task_name="Unique Searchable Task Name")
+    # Not a valid UUID (too short, non-hex trailing segment) -- must not
+    # raise, and must fall back safely to the Task Name / Dataset Name
+    # substring search path rather than propagating the ValueError from
+    # uuid.UUID(...).
+    malformed_no_match = "not-a-valid-uuid-zzzz"
+    page_no_match = fetch_review_queue(
+        db_session, org_id, ReviewQueueFilters(search=malformed_no_match), "created_at", limit=10, offset=0
+    )
+    assert page_no_match.total == 0
+    assert page_no_match.items == []
+    assert page_no_match.summary["total_items"] == 0
+
+    # A malformed (non-UUID) string that IS a genuine substring of the
+    # task name must still match via the fallback path -- proving the
+    # fallback is a real, working search, not just a silent no-op.
+    malformed_but_matching = "searchable-task-zzz"  # not a valid UUID
+    with pytest.raises(ValueError):
+        uuid.UUID(malformed_but_matching)
+    page_match = fetch_review_queue(
+        db_session, org_id, ReviewQueueFilters(search="Searchable Task"), "created_at", limit=10, offset=0
+    )
+    assert page_match.total == 8
+
+    # Tenant isolation must hold under the fallback search path too.
+    other_org_id = uuid.uuid4()
+    _seed_full_queue(db_session, other_org_id, task_name="Other Searchable Task", dataset_name="Other Dataset")
+    page_other_org = fetch_review_queue(
+        db_session, other_org_id, ReviewQueueFilters(search=malformed_no_match), "created_at", limit=10, offset=0
+    )
+    assert page_other_org.total == 0
+
+
+def test_combined_review_category_and_source_filter(db_session):
+    org_id = uuid.uuid4()
+    _seed_full_queue(db_session, org_id)
+
+    page = fetch_review_queue(
+        db_session, org_id,
+        ReviewQueueFilters(review_category=("PROCESSING",), source=("cleaning_run",)),
+        "created_at", limit=10, offset=0,
+    )
+    assert page.total == 1
+    assert page.items[0]["source"] == "cleaning_run"
+    assert page.items[0]["review_category"] == "PROCESSING"
+    assert page.summary["total_items"] == 1
+    assert page.summary["pending_reviews"] == 1
+
+    # A combination matching nothing (DOWNLOAD category never has source
+    # cleaning_run) must return an empty, internally-consistent result.
+    page_empty = fetch_review_queue(
+        db_session, org_id,
+        ReviewQueueFilters(review_category=("DOWNLOAD",), source=("cleaning_run",)),
+        "created_at", limit=10, offset=0,
+    )
+    assert page_empty.total == 0
+    assert page_empty.summary["total_items"] == 0
+
+
+def test_combined_review_category_review_type_and_source_filter(db_session):
+    org_id = uuid.uuid4()
+    _seed_full_queue(db_session, org_id)
+
+    page = fetch_review_queue(
+        db_session, org_id,
+        ReviewQueueFilters(
+            review_category=("DOWNLOAD",), review_type=("INTEGRITY_FAILURE",),
+            source=("artifact_download_event",),
+        ),
+        "created_at", limit=10, offset=0,
+    )
+    assert page.total == 1
+    assert page.items[0]["review_type"] == "INTEGRITY_FAILURE"
+    assert page.summary["download_failures"] == 1
+
+    # Cross-tenant safety under a combined filter: a second, unrelated
+    # organization must never contribute rows regardless of how many
+    # filter dimensions are applied together.
+    other_org_id = uuid.uuid4()
+    _seed_full_queue(db_session, other_org_id, task_name="Other Org Task", dataset_name="Other Org Dataset")
+    page_scoped = fetch_review_queue(
+        db_session, org_id,
+        ReviewQueueFilters(
+            review_category=("DOWNLOAD",), review_type=("INTEGRITY_FAILURE",),
+            source=("artifact_download_event",),
+        ),
+        "created_at", limit=10, offset=0,
+    )
+    assert page_scoped.total == 1
+    assert all(i["organization_id"] == org_id for i in page_scoped.items)
