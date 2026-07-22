@@ -7,16 +7,32 @@ inactive DataSource, or a run requested against an inactive Task, both 404
 rather than a distinct "conflict" status — per explicit product decision,
 so inactive-resource behavior is uniform across the whole API.
 """
+import logging
+import os
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timezone
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.deps import PaginationParams, get_current_active_user
-from app.db.session import get_db
+from app.artifacts.download import (
+    ArtifactIntegrityError,
+    ArtifactMissingError,
+    ArtifactPathError,
+    iter_artifact_chunks,
+    open_verified_artifact,
+    resolve_artifact_path,
+    safe_download_filename,
+)
+from app.core.config import get_settings
+from app.db.session import SessionLocal, get_db
+from app.models.artifact_download_event import ArtifactDownloadEvent
 from app.models.cleaning_change import CleaningChange
 from app.models.cleaning_run import CleaningRun
 from app.models.data_profile import DataProfile
@@ -62,6 +78,8 @@ from app.schemas.standardization_run import StandardizationRunRead
 from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
 from app.schemas.task_run import TaskRunCreate, TaskRunRead
 from app.schemas.task_run_event import TaskRunEventRead
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
@@ -1325,11 +1343,14 @@ def list_match_rule_sets(
 # real deduplicated output CSV. Endpoint shape is a direct structural
 # mirror of the matching-result endpoints above (_get_match_run_or_404 /
 # get_task_run_matching / approve/reject/rollback), extended with a
-# summary that DOES include output_file_path/output_sha256/file metadata
-# (unlike MatchRunRead) since Export -- unlike Match -- writes a real
-# file. No configuration-CRUD endpoints exist for Module 9: there is no
+# summary that DOES include output_sha256/file metadata (unlike
+# MatchRunRead) since Export -- unlike Match -- writes a real file. No
+# configuration-CRUD endpoints exist for Module 9: there is no
 # organization-configurable export behavior in this release (see design
-# doc Section 5's non-goals).
+# doc Section 5's non-goals). Module 10 removed output_file_path from
+# this summary (see docs/module-10-artifact-retrieval-design.md Section
+# 13) -- retrieve the artifact itself via
+# GET .../export/download.
 
 
 def _get_export_run_or_404(
@@ -1504,3 +1525,267 @@ def rollback_task_run_export(
     db.commit()
     db.refresh(export_run)
     return export_run
+
+
+# --- Module 10: artifact retrieval (secure download) -------------------
+#
+# Serves the verified bytes of an APPROVED or ROLLED_BACK cleaning/
+# standardization/export run's output file. No new TaskType, no worker
+# changes -- purely additive API + one new audit table
+# (ArtifactDownloadEvent) over files these three modules already write.
+# See docs/module-10-artifact-retrieval-design.md.
+#
+# NO ARTIFACT BYTES ARE SENT BEFORE INTEGRITY VERIFICATION SUCCEEDS: the
+# full artifact is re-hashed via bounded chunked reads, through a SINGLE
+# open() call, before the HTTP response body begins; only a confirmed
+# SHA-256 match causes any byte to be transmitted (Section 6/13).
+#
+# This is NOT a side-effect-free operation: it is artifact-read-only
+# (the file itself is never modified) and audit-writing (exactly one
+# ArtifactDownloadEvent row is created and later finalized per
+# authorized attempt). Artifact content retrieval is deterministic and
+# repeatable across requests; the audit side effect is intentionally
+# non-idempotent per request -- each authorized attempt gets its own
+# event, by design (Section 9's consistency correction).
+
+# Maps each artifact type to the tenant-scoped root its output files are
+# written under (app.core.config.Settings), and to the single non-null
+# run-id column on ArtifactDownloadEvent it corresponds to.
+_ARTIFACT_ROOT_SETTINGS = {
+    "cleaning": "csv_output_root",
+    "standardization": "csv_standardized_root",
+    "export": "csv_exported_root",
+}
+_ARTIFACT_RUN_ID_FIELDS = {
+    "cleaning": "cleaning_run_id",
+    "standardization": "standardization_run_id",
+    "export": "export_run_id",
+}
+
+
+def _finalize_download_event(
+    event_id: uuid.UUID,
+    *,
+    outcome: str,
+    failure_reason_code: str | None = None,
+    verified_sha256: str | None = None,
+    bytes_served: int | None = None,
+) -> None:
+    """Performs the ONE terminal update on an ArtifactDownloadEvent row --
+    never a second insert for the same authorized attempt, and never
+    updated again after this call. Uses its OWN, independent database
+    session (SessionLocal directly, not the endpoint's injected
+    Depends(get_db) session) because the success/failure path that
+    matters most -- finalizing after a streamed transfer -- runs from
+    inside a StreamingResponse generator, which the ASGI server drives
+    AFTER the endpoint function has already returned; by that point the
+    request's own injected session may already be closed. Used
+    identically for the pre-stream failure paths (file_missing,
+    integrity_failed) so there is exactly one finalization code path,
+    not two."""
+    session = SessionLocal()
+    try:
+        event = session.get(ArtifactDownloadEvent, event_id)
+        if event is None:
+            return
+        event.outcome = outcome
+        event.failure_reason_code = failure_reason_code
+        if verified_sha256 is not None:
+            event.verified_sha256 = verified_sha256
+        if bytes_served is not None:
+            event.bytes_served = bytes_served
+        event.completed_at = datetime.now(timezone.utc)
+        session.commit()
+    finally:
+        session.close()
+
+
+def _download_artifact(
+    db: Session,
+    current_user: User,
+    artifact_type: str,
+    run: CleaningRun | StandardizationRun | ExportRun,
+) -> StreamingResponse:
+    """Shared verify-then-stream download logic for all three artifact
+    types. Exact operation ordering (Section 9's consistency
+    correction): resolve tenant-scoped run (by the caller, via the
+    existing _get_*_run_or_404 helpers) -> validate downloadable state
+    -> resolve and contain path -> create started audit row -> open and
+    verify the full artifact (this single open() call also resolves
+    file-existence/regular-file, folded into the same attempt rather
+    than a separate stat -- see app.artifacts.download) -> begin
+    streaming only after a confirmed hash match -> finalize the audit
+    outcome once the transfer completes or fails.
+
+    Downloadable-state policy (Section 11): approved is the current
+    authoritative output; rolled_back is downloadable strictly for
+    audit/investigation, explicitly NOT current authoritative output --
+    the X-Artifact-Run-Status response header always carries the run's
+    actual status so a client is never left to infer this. pending_review
+    and rejected are blocked (409), and never create an audit row, since
+    authorization never succeeded for them.
+    """
+    if run.status not in ("approved", "rolled_back"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot download an artifact with status '{run.status}'",
+        )
+
+    tenant_root = Path(
+        getattr(get_settings(), _ARTIFACT_ROOT_SETTINGS[artifact_type])
+    ) / str(current_user.organization_id)
+
+    try:
+        resolved_path = resolve_artifact_path(tenant_root, run.output_file_path)
+    except ArtifactPathError:
+        # Defense-in-depth only -- output_file_path is always written
+        # server-side by CleaningHandler/StandardizationHandler/
+        # ExportHandler, never client-supplied. Path containment is
+        # validated before any audit row is created (canonical
+        # ordering), so a violation here creates no row.
+        logger.error(
+            "artifact download path containment violation: artifact_type=%s run_id=%s",
+            artifact_type, run.id,
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+
+    event = ArtifactDownloadEvent(
+        id=uuid.uuid4(),
+        organization_id=current_user.organization_id,
+        artifact_type=artifact_type,
+        downloaded_by=current_user.id,
+        run_status_at_request=run.status,
+        outcome="started",
+        **{_ARTIFACT_RUN_ID_FIELDS[artifact_type]: run.id},
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    event_id = event.id
+
+    try:
+        fileobj = open_verified_artifact(resolved_path, run.output_sha256)
+    except ArtifactMissingError as exc:
+        _finalize_download_event(
+            event_id, outcome="file_missing", failure_reason_code=exc.failure_reason_code
+        )
+        logger.error(
+            "artifact download file missing or unreadable: artifact_type=%s run_id=%s "
+            "reason=%s",
+            artifact_type, run.id, exc.failure_reason_code,
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    except ArtifactIntegrityError:
+        _finalize_download_event(
+            event_id, outcome="integrity_failed", failure_reason_code="hash_mismatch"
+        )
+        # High-severity log, deliberately WITHOUT the expected/actual
+        # hash values or the filesystem path -- those never appear in
+        # any client-facing response either (Section 13).
+        logger.critical(
+            "ARTIFACT INTEGRITY VERIFICATION FAILED -- no bytes were sent: "
+            "artifact_type=%s run_id=%s",
+            artifact_type, run.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Artifact integrity verification failed; download refused",
+        )
+
+    try:
+        verified_size = os.fstat(fileobj.fileno()).st_size
+    except OSError:
+        # Extremely narrow window: verification just succeeded and the
+        # descriptor is open and rewound, but the fstat() call itself
+        # failed before streaming could begin. Without this branch the
+        # descriptor would leak and the audit row would stay stuck at
+        # 'started' forever -- every other failure branch in this
+        # function already closes the file and reaches a terminal
+        # outcome, so this one must too.
+        fileobj.close()
+        _finalize_download_event(
+            event_id,
+            outcome="stream_failed",
+            failure_reason_code="io_error",
+            verified_sha256=run.output_sha256,
+            bytes_served=0,
+        )
+        logger.error(
+            "artifact download failed after verification, before streaming began: "
+            "artifact_type=%s run_id=%s",
+            artifact_type, run.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Artifact could not be prepared for download",
+        )
+    verified_sha256 = run.output_sha256
+
+    def _stream() -> Iterator[bytes]:
+        bytes_sent = 0
+        completed = False
+        try:
+            for chunk in iter_artifact_chunks(fileobj):
+                bytes_sent += len(chunk)
+                yield chunk
+            completed = True
+        finally:
+            _finalize_download_event(
+                event_id,
+                outcome="completed" if completed else "stream_failed",
+                failure_reason_code=None if completed else "stream_interrupted",
+                verified_sha256=verified_sha256,
+                bytes_served=bytes_sent,
+            )
+
+    filename = safe_download_filename(artifact_type, run.id)
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Content-Length": str(verified_size),
+        "X-Artifact-Run-Status": run.status,
+    }
+    return StreamingResponse(_stream(), media_type="text/csv", headers=headers)
+
+
+@router.get("/{task_id}/runs/{run_id}/cleaning/download")
+def download_task_run_cleaning(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """Module 10: streams the verified bytes of a cleaning run's output
+    CSV. 404 if the run isn't visible to this org or the artifact is
+    missing/unreadable; 409 if the run is pending_review or rejected;
+    500 if pre-stream integrity verification fails (no bytes sent in
+    that case). See _download_artifact for the full flow."""
+    cleaning_run = _get_cleaning_run_or_404(db, task_id, run_id, current_user.organization_id)
+    return _download_artifact(db, current_user, "cleaning", cleaning_run)
+
+
+@router.get("/{task_id}/runs/{run_id}/standardization/download")
+def download_task_run_standardization(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """Module 10: streams the verified bytes of a standardization run's
+    output CSV. Same behavior/status codes as download_task_run_cleaning."""
+    standardization_run = _get_standardization_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+    return _download_artifact(db, current_user, "standardization", standardization_run)
+
+
+@router.get("/{task_id}/runs/{run_id}/export/download")
+def download_task_run_export(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """Module 10: streams the verified bytes of an export run's output
+    CSV. Same behavior/status codes as download_task_run_cleaning."""
+    export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
+    return _download_artifact(db, current_user, "export", export_run)
