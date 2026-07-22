@@ -1692,7 +1692,33 @@ def _download_artifact(
             detail="Artifact integrity verification failed; download refused",
         )
 
-    verified_size = os.fstat(fileobj.fileno()).st_size
+    try:
+        verified_size = os.fstat(fileobj.fileno()).st_size
+    except OSError:
+        # Extremely narrow window: verification just succeeded and the
+        # descriptor is open and rewound, but the fstat() call itself
+        # failed before streaming could begin. Without this branch the
+        # descriptor would leak and the audit row would stay stuck at
+        # 'started' forever -- every other failure branch in this
+        # function already closes the file and reaches a terminal
+        # outcome, so this one must too.
+        fileobj.close()
+        _finalize_download_event(
+            event_id,
+            outcome="stream_failed",
+            failure_reason_code="io_error",
+            verified_sha256=run.output_sha256,
+            bytes_served=0,
+        )
+        logger.error(
+            "artifact download failed after verification, before streaming began: "
+            "artifact_type=%s run_id=%s",
+            artifact_type, run.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Artifact could not be prepared for download",
+        )
     verified_sha256 = run.output_sha256
 
     def _stream() -> Iterator[bytes]:

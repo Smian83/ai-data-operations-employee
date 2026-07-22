@@ -629,6 +629,78 @@ def test_download_mid_stream_failure_records_stream_failed_with_partial_bytes(
         get_settings.cache_clear()
 
 
+def test_failure_after_verification_before_streaming_records_stream_failed(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    """Regression test (final review finding): between a successful
+    open_verified_artifact() call and the StreamingResponse actually
+    being constructed, _download_artifact calls os.fstat() to compute
+    Content-Length. If that call fails, the already-open, already-
+    verified file descriptor must still be closed and the audit row
+    must still reach a terminal outcome -- not leak the descriptor or
+    leave the row stuck at 'started' forever.
+
+    The fstat() patch below only intercepts the exact file descriptor
+    opened for this download (captured by wrapping
+    open_verified_artifact) and delegates every other fd to the real
+    os.fstat -- so this cannot collaterally break unrelated fstat calls
+    made elsewhere during the same request (e.g. by the DB driver)."""
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        client.post(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/approve",
+            headers=headers,
+        )
+
+        import app.api.tasks as tasks_module
+
+        real_open_verified_artifact = tasks_module.open_verified_artifact
+        opened_fileobjs = []
+
+        def _capturing_open_verified_artifact(path, expected_sha256):
+            fileobj = real_open_verified_artifact(path, expected_sha256)
+            opened_fileobjs.append(fileobj)
+            return fileobj
+
+        monkeypatch.setattr(
+            tasks_module, "open_verified_artifact", _capturing_open_verified_artifact
+        )
+
+        real_fstat = tasks_module.os.fstat
+
+        def _flaky_fstat(fd, *args, **kwargs):
+            if opened_fileobjs and fd == opened_fileobjs[0].fileno():
+                raise OSError("simulated fstat failure")
+            return real_fstat(fd, *args, **kwargs)
+
+        monkeypatch.setattr(tasks_module.os, "fstat", _flaky_fstat)
+
+        response = client.get(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/download",
+            headers=headers,
+        )
+        assert response.status_code == 500, response.text
+        assert response.headers["content-type"].startswith("application/json")
+
+        assert opened_fileobjs, "open_verified_artifact was never called"
+        assert opened_fileobjs[0].closed, "file descriptor was leaked after fstat() failure"
+
+        db_session.expire_all()
+        events = _events_for_export_run(db_session, ids["export_run_id"])
+        assert len(events) == 1
+        assert events[0].outcome == "stream_failed"
+        assert events[0].failure_reason_code == "io_error"
+        assert events[0].bytes_served == 0
+        # Verification succeeded before the fstat() failure -- the hash
+        # is still recorded.
+        assert events[0].verified_sha256 is not None
+        assert events[0].completed_at is not None
+    finally:
+        get_settings.cache_clear()
+
+
 # --- output_file_path removal ---------------------------------------------
 
 
