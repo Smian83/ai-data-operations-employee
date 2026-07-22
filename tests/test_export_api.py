@@ -9,10 +9,12 @@ import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.export.engine import RESERVED_CANONICAL_RECORD_COLUMN
 from app.models.data_source import DataSource
+from app.models.export_run import ExportRun
 from app.models.task import Task
 from app.models.task_run import TaskRun
 from app.worker.handlers.base import ExecutionContext
@@ -265,7 +267,12 @@ def test_get_export_summary_and_exclusions(
         assert body["duplicate_groups_materialized_count"] == 1
         assert body["csv_format_version"] == 1
         assert body["output_column_count"] == 5
-        assert "output_file_path" in body
+        # Module 10: output_file_path is deliberately absent from the API
+        # response (removed per architectural review -- see
+        # docs/module-10-artifact-retrieval-design.md Section 13);
+        # output_sha256 remains, since a content hash is not a
+        # filesystem detail.
+        assert "output_file_path" not in body
         assert "output_sha256" in body
         assert "export_timestamp" in body
 
@@ -416,8 +423,17 @@ def test_export_rollback_does_not_delete_the_output_file(
         headers = _auth_headers(client, uuid.uuid4().hex)
         export_task_id, export_run_id = _build_completed_export_run(client, db_session, csv_root, headers)
 
-        summary = client.get(f"/tasks/{export_task_id}/runs/{export_run_id}/export", headers=headers)
-        output_path = Path(summary.json()["output_file_path"])
+        # Module 10: output_file_path is no longer in the API response
+        # (Section 13); fetch it via the ORM row directly, the same
+        # pattern every other test in this suite that needs the
+        # server-local path already uses.
+        # export_run_id here is the TaskRun id (the URL's run_id) --
+        # ExportRun is looked up by task_run_id, mirroring
+        # _get_export_run_or_404's own lookup in app.api.tasks.
+        export_run = db_session.execute(
+            select(ExportRun).where(ExportRun.task_run_id == uuid.UUID(export_run_id))
+        ).scalar_one()
+        output_path = Path(export_run.output_file_path)
         assert output_path.exists()
 
         client.post(f"/tasks/{export_task_id}/runs/{export_run_id}/export/approve", headers=headers)
@@ -435,8 +451,15 @@ def test_exported_csv_header_never_contains_a_reserved_column_from_input(
     try:
         headers = _auth_headers(client, uuid.uuid4().hex)
         export_task_id, export_run_id = _build_completed_export_run(client, db_session, csv_root, headers)
-        summary = client.get(f"/tasks/{export_task_id}/runs/{export_run_id}/export", headers=headers)
-        output_path = Path(summary.json()["output_file_path"])
+        # Module 10: output_file_path is no longer in the API response
+        # (Section 13); fetch it via the ORM row directly.
+        # export_run_id here is the TaskRun id (the URL's run_id) --
+        # ExportRun is looked up by task_run_id, mirroring
+        # _get_export_run_or_404's own lookup in app.api.tasks.
+        export_run = db_session.execute(
+            select(ExportRun).where(ExportRun.task_run_id == uuid.UUID(export_run_id))
+        ).scalar_one()
+        output_path = Path(export_run.output_file_path)
         header = output_path.read_text(encoding="utf-8").splitlines()[0]
         assert header.count(RESERVED_CANONICAL_RECORD_COLUMN) == 1
     finally:
