@@ -20,6 +20,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # truth. Both must be changed together if this floor is ever revisited.
 SCHEDULE_INTERVAL_HARD_FLOOR_SECONDS = 30
 
+# Module 13: the same "fixed, non-configurable database safety floor"
+# pattern applied to output artifact retention -- see
+# ck_artifact_retention_events_window_days_hard_floor in
+# app/models/artifact_retention_event.py
+# (RETENTION_WINDOW_HARD_FLOOR_DAYS_DB). Hand-kept-in-sync with that
+# constant, not derived, for the identical reason SCHEDULE_INTERVAL_HARD_
+# FLOOR_SECONDS is hand-kept-in-sync with its own database CHECK.
+RETENTION_WINDOW_HARD_FLOOR_DAYS = 7
+
 
 class Settings(BaseSettings):
     """Central application settings, populated from environment variables."""
@@ -243,6 +252,57 @@ class Settings(BaseSettings):
                 "MINIMUM_SCHEDULE_INTERVAL_SECONDS"
             )
         return self
+
+    # --- Output artifact retention (Module 13) ---
+    # Master switch -- every other setting in this block is inert while
+    # this is false. Default false: no artifact is ever purged unless an
+    # operator has made an explicit, documented decision to enable it. See
+    # docs/module-13-output-artifact-retention-design.md Sections 6, 21.
+    output_retention_enabled: bool = Field(
+        default=False, alias="OUTPUT_RETENTION_ENABLED"
+    )
+    # The real, operator-facing minimum -- enforced here, at process
+    # startup (fail-fast, never silently clamped), the same convention
+    # minimum_schedule_interval_seconds already established. Its own `ge`
+    # bound ties it structurally to RETENTION_WINDOW_HARD_FLOOR_DAYS (the
+    # fixed database floor -- see
+    # ck_artifact_retention_events_window_days_hard_floor in
+    # app/models/artifact_retention_event.py): this setting can never be
+    # configured below that floor, so the two layers can never end up
+    # inconsistent at runtime.
+    output_retention_window_days: int = Field(
+        default=30,
+        alias="OUTPUT_RETENTION_WINDOW_DAYS",
+        ge=RETENTION_WINDOW_HARD_FLOOR_DAYS,
+    )
+    # Gates app.worker.retention.purge_expired_artifacts() inside the same
+    # run_forever() loop that already gates run_due_schedules() (Module
+    # 12) and reap_expired_runs() -- same type (float), same
+    # time.monotonic()-based comparison, same bounded-but-configurable
+    # convention as every other worker-loop interval in this file.
+    # Deliberately a much longer default than the scheduler's own 15s
+    # poll interval -- retention is the lowest-urgency background pass in
+    # this system; nothing depends on it running promptly.
+    retention_poll_interval_seconds: float = Field(
+        default=3600.0, alias="RETENTION_POLL_INTERVAL_SECONDS", ge=60.0, le=86400.0
+    )
+    # Maximum eligible artifacts processed per retention pass (a bounded
+    # loop of independent single-artifact transactions -- see
+    # app/worker/retention.py). Mirrors worker_claim_batch_size's and
+    # scheduler_claim_batch_size's own convention exactly.
+    retention_claim_batch_size: int = Field(
+        default=50, alias="RETENTION_CLAIM_BATCH_SIZE", gt=0
+    )
+    # When true, a retention pass evaluates and records every eligible
+    # artifact exactly as it would for real, but never actually deletes a
+    # file and never sets output_deleted_at on the owning run -- lets an
+    # operator observe a policy's impact via artifact_retention_events
+    # before ever enabling real deletion. See
+    # docs/module-13-output-artifact-retention-design.md's lifecycle
+    # section for the full dry-run/PURGE_PENDING interaction.
+    output_retention_dry_run: bool = Field(
+        default=False, alias="OUTPUT_RETENTION_DRY_RUN"
+    )
 
     @property
     def is_production(self) -> bool:

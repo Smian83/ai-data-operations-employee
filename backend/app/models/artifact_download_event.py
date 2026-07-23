@@ -33,6 +33,17 @@ streaming-response lifecycle can reliably and transactionally
 distinguish a client disconnect from a server-side I/O failure was not
 established by inspection, so 'stream_failed' deliberately covers both
 rather than asserting an unverified detection guarantee.
+
+Module 13 addition: 'purged' is a sixth outcome, added alongside the
+original five, for a download attempt against a run whose output artifact
+has already been removed by the retention module (run.output_deleted_at
+IS NOT NULL). It is created directly as a single-shot terminal row (never
+via a 'started'-then-'purged' transition -- the file's absence is already
+known before any row is created), and -- unlike integrity_failed/
+file_missing/stream_failed -- never carries a failure_reason_code, since a
+purge is an expected, intentional prior action, not a failure of this
+request. See app/api/tasks.py's download endpoints and
+docs/module-13-output-artifact-retention-design.md.
 """
 import uuid
 from datetime import datetime
@@ -69,7 +80,18 @@ ARTIFACT_DOWNLOAD_OUTCOMES = (
     "integrity_failed",
     "file_missing",
     "stream_failed",
+    # Module 13: the artifact was intentionally removed by the retention
+    # module before this request -- see the module docstring above.
+    "purged",
 )
+
+# Failure outcomes require a failure_reason_code; started/completed/purged
+# never do (purged is an expected, intentional prior state, not a failure
+# of this request). Kept as an explicit tuple, not derived by exclusion,
+# so both this model and its migration can be visually diffed against each
+# other rather than one being implicitly "whatever isn't in the other
+# list."
+ARTIFACT_DOWNLOAD_FAILURE_OUTCOMES = ("integrity_failed", "file_missing", "stream_failed")
 
 # Controlled internal failure codes -- never raw exception text, never a
 # filesystem path. Present exactly when outcome is a failure outcome.
@@ -126,12 +148,15 @@ class ArtifactDownloadEvent(Base):
             "outcome IN (" + ", ".join(f"'{o}'" for o in ARTIFACT_DOWNLOAD_OUTCOMES) + ")",
             name="ck_artifact_download_events_outcome_valid",
         ),
-        # A failure_reason_code exists exactly when outcome is a failure
-        # outcome -- never present for started/completed, always present
-        # otherwise.
+        # A failure_reason_code exists exactly when outcome is one of the
+        # three genuine failure outcomes -- never present for
+        # started/completed/purged (Module 13: purged is an expected,
+        # intentional prior state, not a failure of this request).
         CheckConstraint(
-            "(outcome IN ('started', 'completed') AND failure_reason_code IS NULL) OR "
-            "(outcome NOT IN ('started', 'completed') AND failure_reason_code IS NOT NULL)",
+            "(outcome IN ('started', 'completed', 'purged') "
+            "AND failure_reason_code IS NULL) OR "
+            "(outcome IN (" + ", ".join(f"'{o}'" for o in ARTIFACT_DOWNLOAD_FAILURE_OUTCOMES)
+            + ") AND failure_reason_code IS NOT NULL)",
             name="ck_artifact_download_events_failure_reason_matches_outcome",
         ),
         CheckConstraint(

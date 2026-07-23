@@ -657,6 +657,91 @@ is no cell-level selective undo. Rolled-back and rejected runs leave their
 output files on disk rather than deleting them, by design -- a storage
 retention policy is deferred, not solved here.
 
+## Output Artifact Retention (Module 13)
+
+Automatic, opt-in deletion of old `CleaningRun`/`StandardizationRun`/
+`ExportRun` output files -- closing the gap Modules 6/7/9 each left open
+(rolled-back/rejected/approved runs previously kept their output files on
+disk forever). Source files under `CSV_INPUT_ROOT` are never touched by
+this module, under any circumstance.
+
+**Disabled by default.** `OUTPUT_RETENTION_ENABLED=false` is the default;
+until an operator explicitly sets it to `true`, no artifact is ever
+evaluated for deletion and no new query is even opened for this purpose.
+
+**Lifecycle (four states, only one persisted).** An artifact is
+**ACTIVE** while `pending_review`, or while terminal (`approved`/
+`rejected`/`rolled_back`) but still inside the configured retention
+window. It becomes **EXPIRED** once terminal and past the window --
+derived at query time from the run's own status/decision-timestamp
+columns, never stored. **PURGE_PENDING** exists only for the duration of
+one artifact's own claim transaction (a `SELECT ... FOR UPDATE`, `SKIP
+LOCKED` on PostgreSQL). **PURGED** is the one new durable fact: the
+run's `output_deleted_at` column is set. The decision timestamp used is
+always the one matching the run's *current* status (`approved_at`,
+`rejected_at`, or `rolled_back_at`) -- never an older one from an earlier
+transition.
+
+**Configuration.** `OUTPUT_RETENTION_WINDOW_DAYS` (default `30`, hard
+floor `7` -- enforced both by Pydantic at startup and by a database
+`CHECK` constraint on every retention audit row) controls how long a
+terminal run's output survives before becoming eligible.
+`RETENTION_CLAIM_BATCH_SIZE` (default `50`) is a single, shared,
+whole-pass budget across all three run types combined (cleaning, then
+standardization, then export) -- never a separate allowance per type.
+`OUTPUT_RETENTION_DRY_RUN` (default `false`) evaluates and audits every
+eligible artifact exactly as a real pass would, but never deletes a file
+and never sets `output_deleted_at` -- the safe way to observe a policy's
+impact before enabling real deletion.
+
+**Worker integration.** A third independent timer inside the existing
+worker loop (`app/worker/runner.py::run_forever`, alongside the Module 12
+scheduler timer and the reaper timer), gated by
+`RETENTION_POLL_INTERVAL_SECONDS` (default `3600`, i.e. hourly -- the
+lowest-urgency background pass in this system). A retention-pass failure
+is caught, rolled back, and logged -- it never crashes the worker process
+or blocks that same iteration's normal task claiming/execution/reaping.
+
+**410 Gone for purged artifacts.** All three download endpoints
+(`GET /tasks/{id}/runs/{run_id}/{cleaning,standardization,export}/download`,
+Module 10) now return `410 Gone` (`{"detail": "Artifact no longer
+available"}`) instead of streaming a file once `output_deleted_at` is
+set -- checked before any filesystem path is resolved or opened, so a
+purged artifact is rejected without ever touching disk. One
+`ArtifactDownloadEvent` row is still written per attempt
+(`outcome="purged"`, no `failure_reason_code` -- a purge is an expected,
+intentional prior action, not a failure of the request), preserving the
+same "every authorized download attempt is audited" guarantee the other
+five outcomes already provide. The response never includes the
+filesystem path or `output_deleted_at`'s value.
+
+**Metrics.** Exposed via the existing `GET /internal/metrics` Prometheus
+endpoint when read from the worker process (see the "Task Execution
+Engine" metrics note on the same process-boundary limitation):
+`retention_passes_total`, `retention_artifacts_eligible_total`,
+`retention_artifacts_purged_total`,
+`retention_artifacts_already_missing_total`,
+`retention_purge_failures_total`, `retention_dry_run_artifacts_total`,
+`retention_bytes_reclaimed_total`, `retention_pass_duration_seconds`
+(histogram), `retention_oldest_eligible_artifact_age_seconds` (gauge),
+and `retention_backlog_artifacts` (gauge). The two gauges are snapshots
+computed once per *enabled* pass, after that pass's own deletions have
+committed -- they hold their last real value while retention is
+disabled, rather than falsely reporting an empty backlog.
+
+**Operational guidance.** Enable dry-run first (`OUTPUT_RETENTION_ENABLED=true`,
+`OUTPUT_RETENTION_DRY_RUN=true`) and watch
+`retention_dry_run_artifacts_total` / `retention_backlog_artifacts` for a
+few poll intervals before switching `OUTPUT_RETENTION_DRY_RUN=false`. A
+non-zero, growing `retention_purge_failures_total` usually means a
+filesystem permissions problem on `CSV_OUTPUT_ROOT` /
+`CSV_STANDARDIZED_ROOT` / `CSV_EXPORTED_ROOT` -- failed artifacts remain
+eligible and are retried automatically on the next pass once the
+underlying problem is fixed; no manual intervention beyond fixing the
+filesystem issue is needed. A manual, on-demand retention-trigger API
+endpoint was considered during design but was never approved and does
+not exist -- retention only ever runs on its worker-loop timer.
+
 ## Health Endpoint
 
 ## Health Endpoint
@@ -697,6 +782,11 @@ See `.env.example` for the full list. Key variables:
 | `CSV_MAX_DISTINCT_VALUES` / `CSV_MAX_SAMPLE_VALUES` | Per-column bounds on retained distinct/sample values in a profile (defaults `100` / `10`) |
 | `CSV_OUTPUT_ROOT` | Server-controlled root for cleaned CSV output; each org confined to `CSV_OUTPUT_ROOT/{organization_id}/`, always distinct from `CSV_INPUT_ROOT` (default `./data/csv_cleaned`) |
 | `CLEANING_MAX_PERSISTED_CHANGES` | Max `CleaningChange` rows persisted per cleaning run; the aggregate `total_changes_count` on `CleaningRun` is always accurate even when capped (default `10000`) |
+| `OUTPUT_RETENTION_ENABLED` | Master switch for Module 13 artifact retention; no artifact is ever evaluated for deletion while `false` (default `false`) |
+| `OUTPUT_RETENTION_WINDOW_DAYS` | Days a terminal run's output survives before becoming eligible for deletion; hard floor `7` (default `30`) |
+| `RETENTION_POLL_INTERVAL_SECONDS` | How often the worker loop runs a retention pass (default `3600`) |
+| `RETENTION_CLAIM_BATCH_SIZE` | Max artifacts processed per retention pass -- one shared budget across all three run types combined (default `50`) |
+| `OUTPUT_RETENTION_DRY_RUN` | Evaluate and audit eligible artifacts without deleting anything or setting `output_deleted_at` (default `false`) |
 
 ## License
 

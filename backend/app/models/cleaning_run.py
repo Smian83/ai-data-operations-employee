@@ -132,6 +132,18 @@ class CleaningRun(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Module 13: NULL means the artifact at output_file_path still exists.
+    # Non-NULL is the sole authoritative "this file no longer exists"
+    # signal -- set only after app.worker.retention confirms a real
+    # deletion or confirms the file was already absent. output_file_path/
+    # output_sha256 above are never cleared on purge -- they remain the
+    # historical record of what was produced and its hash, even after the
+    # bytes themselves are gone. See
+    # docs/module-13-output-artifact-retention-design.md.
+    output_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

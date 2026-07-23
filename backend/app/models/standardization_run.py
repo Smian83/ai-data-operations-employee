@@ -121,6 +121,14 @@ class StandardizationRun(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Module 13: see the identical field on CleaningRun for the full
+    # rationale -- NULL means the artifact still exists; non-NULL is the
+    # sole authoritative "purged" signal, never inferred from anything
+    # else. output_file_path/output_sha256 are never cleared on purge.
+    output_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
