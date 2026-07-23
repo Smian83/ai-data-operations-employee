@@ -21,6 +21,7 @@ from app.worker.engine import LeaseLostError, claim_batch, complete_failure, com
 from app.worker.handlers import PermanentHandlerLookupError, get_handler
 from app.worker.handlers.base import ExecutionContext
 from app.worker.reaper import reap_expired_runs
+from app.worker.scheduler import run_due_schedules
 from app.core.config import get_settings
 from app.worker.handlers.base import PermanentExecutionError, TransientExecutionError
 
@@ -94,15 +95,34 @@ def run_forever() -> None:  # pragma: no cover - exercised via execute_one/claim
     worker_id = _worker_id()
     logger.info("Worker %s starting", worker_id)
     last_reap = 0.0
+    last_schedule = 0.0
 
     while True:
         db = SessionLocal()
         try:
+            # Module 12: runs BEFORE claim_batch (not after) so a TaskRun
+            # the scheduler creates this iteration can be picked up by
+            # THIS SAME iteration's claim_batch call below, rather than
+            # waiting a full worker_poll_interval_seconds for the next
+            # loop. Wrapped defensively: an isolated scheduling failure
+            # (e.g. a transient DB error on the initial due-task SELECT,
+            # outside any single task's own per-task try/except in
+            # run_due_schedules) must never crash the whole worker process
+            # -- claiming and executing already-pending TaskRuns, and
+            # reaping, must continue regardless.
+            now = time.monotonic()
+            if now - last_schedule >= settings.scheduler_poll_interval_seconds:
+                try:
+                    run_due_schedules(db, worker_id="scheduler", batch_size=settings.scheduler_claim_batch_size)
+                except Exception:  # noqa: BLE001 - see comment above
+                    db.rollback()
+                    logger.exception("Scheduler pass failed unexpectedly")
+                last_schedule = now
+
             claimed = claim_batch(db, worker_id)
             for task_run in claimed:
                 execute_one(db, task_run, worker_id)
 
-            now = time.monotonic()
             if now - last_reap >= settings.reaper_poll_interval_seconds:
                 reap_expired_runs(db, worker_id="reaper")
                 last_reap = now

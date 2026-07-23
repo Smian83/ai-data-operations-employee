@@ -11,7 +11,7 @@ import logging
 import os
 import uuid
 from collections.abc import Iterator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -54,6 +54,7 @@ from app.models.task import Task
 from app.models.task_run import TaskRun
 from app.models.task_run_event import TaskRunEvent
 from app.models.user import User
+from app.services.task_run_factory import create_task_run_record
 from app.schemas.cleaning_change import CleaningChangeRead
 from app.schemas.cleaning_run import CleaningRunRead
 from app.schemas.data_profile import DataProfileRead
@@ -130,6 +131,32 @@ def _validate_data_source_ref(
         )
 
 
+def _validate_schedule_interval_task_type(
+    task_type: TaskType, schedule_interval_seconds: int | None
+) -> None:
+    """schedule_interval_seconds is only meaningful for SYNC tasks -- a
+    scheduled TRANSFORM/STANDARDIZE/MATCH/EXPORT would need a chaining
+    decision (which prior run to build on) that scheduling alone can't
+    resolve, and OTHER has no defined execution semantics at all. Same
+    category of cross-field, task-type-dependent business rule as
+    source_task_run_id's own validation in create_task_run below -- same
+    400 status, same explicit-HTTPException style, not a Pydantic-level
+    check, since it depends on another field's value."""
+    if schedule_interval_seconds is not None and task_type != TaskType.SYNC:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="schedule_interval_seconds is only valid for SYNC tasks",
+        )
+
+
+def _compute_next_run_at(schedule_interval_seconds: int) -> datetime:
+    """Always anchored to "now", never to any prior next_run_at -- see
+    app/worker/scheduler.py's own module docstring for why this is also
+    the missed-schedule catch-up rule, not just the initial-activation
+    rule."""
+    return datetime.now(timezone.utc) + timedelta(seconds=schedule_interval_seconds)
+
+
 @router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: TaskCreate,
@@ -144,6 +171,8 @@ def create_task(
             detail=f"A task named '{payload.name}' already exists",
         )
 
+    _validate_schedule_interval_task_type(payload.task_type, payload.schedule_interval_seconds)
+
     task = Task(
         organization_id=current_user.organization_id,
         data_source_id=payload.data_source_id,
@@ -151,6 +180,12 @@ def create_task(
         description=payload.description,
         task_type=payload.task_type,
         schedule=payload.schedule,
+        schedule_interval_seconds=payload.schedule_interval_seconds,
+        next_run_at=(
+            _compute_next_run_at(payload.schedule_interval_seconds)
+            if payload.schedule_interval_seconds is not None
+            else None
+        ),
         max_attempts=payload.max_attempts,
         timeout_seconds=payload.timeout_seconds,
         created_by=current_user.id,
@@ -228,6 +263,26 @@ def update_task(
         task.task_type = payload.task_type
     if "schedule" in payload.model_fields_set:
         task.schedule = payload.schedule
+
+    # schedule_interval_seconds: omitted from the request -> leave the
+    # current schedule entirely unchanged (payload.model_fields_set, not
+    # `is not None`, is what distinguishes "omitted" from "explicit null" --
+    # same mechanism already used for `schedule`/`data_source_id` above).
+    if "schedule_interval_seconds" in payload.model_fields_set:
+        if payload.schedule_interval_seconds is None:
+            task.schedule_interval_seconds = None
+            task.next_run_at = None
+        else:
+            task.schedule_interval_seconds = payload.schedule_interval_seconds
+            task.next_run_at = _compute_next_run_at(payload.schedule_interval_seconds)
+
+    # Re-validated against the task's FINAL state (not just this request's
+    # own fields): a request that changes task_type away from SYNC while
+    # leaving an already-set schedule_interval_seconds untouched must be
+    # rejected too, or the SYNC-only invariant could be silently violated
+    # without ever touching the schedule field in that same request.
+    _validate_schedule_interval_task_type(task.task_type, task.schedule_interval_seconds)
+
     if "max_attempts" in payload.model_fields_set:
         task.max_attempts = payload.max_attempts
     if "timeout_seconds" in payload.model_fields_set:
@@ -315,16 +370,13 @@ def create_task_run(
             ),
         )
 
-    run = TaskRun(
+    run = create_task_run_record(
+        db,
         organization_id=current_user.organization_id,
         task_id=task.id,
         triggered_by=current_user.id,
         source_task_run_id=source_task_run_id,
-        # status defaults to PENDING at the model layer; started_at/
-        # finished_at/error_message all remain NULL, satisfying
-        # ck_task_runs_status_invariants for the 'pending' branch.
     )
-    db.add(run)
     db.commit()
     db.refresh(run)
     return run
