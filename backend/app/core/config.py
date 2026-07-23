@@ -8,8 +8,17 @@ should hardcode environment-specific values.
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Module 12: the fixed, non-configurable database safety floor (see
+# ck_tasks_schedule_interval_hard_floor in app/models/task.py). Duplicated
+# here (not derived programmatically) only as the lower bound for
+# minimum_schedule_interval_seconds below -- Alembic migrations cannot read
+# Settings at migration-authoring time, so these two "30"s are a
+# deliberately, explicitly hand-kept-in-sync pair, not a single source of
+# truth. Both must be changed together if this floor is ever revisited.
+SCHEDULE_INTERVAL_HARD_FLOOR_SECONDS = 30
 
 
 class Settings(BaseSettings):
@@ -187,6 +196,53 @@ class Settings(BaseSettings):
     export_max_persisted_exclusions: int = Field(
         default=10_000, alias="EXPORT_MAX_PERSISTED_EXCLUSIONS", gt=0
     )
+
+    # --- Scheduled task execution (Module 12) ---
+    # Gates app.worker.scheduler.run_due_schedules() inside the same
+    # run_forever() loop that already gates reap_expired_runs() via
+    # reaper_poll_interval_seconds -- same type (float), same
+    # time.monotonic()-based comparison, same bounded-but-configurable
+    # convention as every other worker-loop interval in this file.
+    scheduler_poll_interval_seconds: float = Field(
+        default=15.0, alias="SCHEDULER_POLL_INTERVAL_SECONDS", ge=1.0, le=300.0
+    )
+    # Maximum due tasks processed per scheduler pass (a bounded loop of
+    # independent single-task transactions -- see app/worker/scheduler.py).
+    # Mirrors worker_claim_batch_size's own convention exactly.
+    scheduler_claim_batch_size: int = Field(
+        default=50, alias="SCHEDULER_CLAIM_BATCH_SIZE", gt=0
+    )
+    # The real, operator-facing minimum -- enforced in Pydantic on every
+    # write to Task.schedule_interval_seconds (app/schemas/task.py). Its
+    # own `ge` bound ties it structurally to
+    # SCHEDULE_INTERVAL_HARD_FLOOR_SECONDS (the fixed database floor, see
+    # app/models/task.py's ck_tasks_schedule_interval_hard_floor): this
+    # setting can never be configured below that floor, so the two layers
+    # can never end up inconsistent at runtime -- pydantic-settings raises
+    # ValidationError at process startup otherwise, exactly like every
+    # other bounded setting in this file.
+    minimum_schedule_interval_seconds: int = Field(
+        default=60,
+        alias="MINIMUM_SCHEDULE_INTERVAL_SECONDS",
+        ge=SCHEDULE_INTERVAL_HARD_FLOOR_SECONDS,
+    )
+    # Application-layer-only ceiling -- no corresponding database CHECK,
+    # since an overly long interval carries no "catch-up storm" safety risk
+    # the way too short an interval does (see
+    # ck_tasks_schedule_interval_hard_floor's own docstring). Default: 30
+    # days.
+    maximum_schedule_interval_seconds: int = Field(
+        default=2_592_000, alias="MAXIMUM_SCHEDULE_INTERVAL_SECONDS", gt=0
+    )
+
+    @model_validator(mode="after")
+    def _validate_schedule_interval_bounds(self) -> "Settings":
+        if self.maximum_schedule_interval_seconds < self.minimum_schedule_interval_seconds:
+            raise ValueError(
+                "MAXIMUM_SCHEDULE_INTERVAL_SECONDS must be greater than or equal to "
+                "MINIMUM_SCHEDULE_INTERVAL_SECONDS"
+            )
+        return self
 
     @property
     def is_production(self) -> bool:
