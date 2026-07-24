@@ -21,6 +21,7 @@ from app.worker.engine import LeaseLostError, claim_batch, complete_failure, com
 from app.worker.handlers import PermanentHandlerLookupError, get_handler
 from app.worker.handlers.base import ExecutionContext
 from app.worker.reaper import reap_expired_runs
+from app.worker.retention import purge_expired_artifacts
 from app.worker.scheduler import run_due_schedules
 from app.core.config import get_settings
 from app.worker.handlers.base import PermanentExecutionError, TransientExecutionError
@@ -96,6 +97,7 @@ def run_forever() -> None:  # pragma: no cover - exercised via execute_one/claim
     logger.info("Worker %s starting", worker_id)
     last_reap = 0.0
     last_schedule = 0.0
+    last_retention = 0.0
 
     while True:
         db = SessionLocal()
@@ -126,6 +128,31 @@ def run_forever() -> None:  # pragma: no cover - exercised via execute_one/claim
             if now - last_reap >= settings.reaper_poll_interval_seconds:
                 reap_expired_runs(db, worker_id="reaper")
                 last_reap = now
+
+            # Module 13: a third, independent background pass, on its own
+            # timer -- unlike the scheduler above, retention has no
+            # same-iteration ordering dependency on claim_batch (it never
+            # produces a TaskRun claim_batch could pick up), so its
+            # placement relative to claim_batch/execute_one does not
+            # matter the way the scheduler's does. Wrapped in the same
+            # defensive try/except as the scheduler pass above: an
+            # isolated retention-pass failure must never crash the worker
+            # process or block claim_batch/execute_one/reap_expired_runs
+            # from running in this same iteration.
+            # purge_expired_artifacts() already returns an all-zero result
+            # without touching any row when settings.output_retention_enabled
+            # is false, so no redundant enabled-check is added here.
+            if now - last_retention >= settings.retention_poll_interval_seconds:
+                try:
+                    purge_expired_artifacts(
+                        db,
+                        batch_size=settings.retention_claim_batch_size,
+                        dry_run=settings.output_retention_dry_run,
+                    )
+                except Exception:  # noqa: BLE001 - see scheduler comment above
+                    db.rollback()
+                    logger.exception("Retention pass failed unexpectedly")
+                last_retention = now
 
             if not claimed:
                 time.sleep(settings.worker_poll_interval_seconds)

@@ -22,11 +22,25 @@ Mirrors app.profiling.csv_loader.resolve_source_path's containment
 technique (same defense-in-depth reasoning), applied here to an
 already-absolute, server-written output path and an output root instead
 of a client-configured relative input path and the input root.
+
+Module 13 note: open_verified_artifact()'s actual file I/O is routed
+through app.artifacts.storage.ArtifactStorage (get_artifact_storage())
+rather than calling Path.open() directly -- an internals-only change.
+resolve_artifact_path remains the sole path-resolution/containment
+boundary, unchanged, and is called strictly before ArtifactStorage is
+ever reached; ArtifactStorage itself has no notion of tenancy or
+containment (see that module's docstring). This function's public
+signature, exception types, and exception-mapping behavior are
+unchanged -- ArtifactStorage.open() propagates the exact same
+FileNotFoundError/IsADirectoryError/OSError set Path.open() always did,
+so the except clauses below did not need to change.
 """
 import hashlib
 from collections.abc import Iterator
 from pathlib import Path
 from typing import BinaryIO
+
+from app.artifacts.storage import get_artifact_storage
 
 # Bounded chunk size used for BOTH the verification read pass and the
 # streaming pass -- memory usage never scales with file size in either
@@ -91,7 +105,7 @@ def open_verified_artifact(path: Path, expected_sha256: str) -> BinaryIO:
         docstring).
     """
     try:
-        fileobj = path.open("rb")
+        fileobj = get_artifact_storage().open(path)
     except FileNotFoundError as exc:
         raise ArtifactMissingError("file_not_found") from exc
     except IsADirectoryError as exc:

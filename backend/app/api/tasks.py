@@ -1660,12 +1660,14 @@ def _download_artifact(
 ) -> StreamingResponse:
     """Shared verify-then-stream download logic for all three artifact
     types. Exact operation ordering (Section 9's consistency
-    correction): resolve tenant-scoped run (by the caller, via the
-    existing _get_*_run_or_404 helpers) -> validate downloadable state
-    -> resolve and contain path -> create started audit row -> open and
-    verify the full artifact (this single open() call also resolves
-    file-existence/regular-file, folded into the same attempt rather
-    than a separate stat -- see app.artifacts.download) -> begin
+    correction, extended by Module 13): resolve tenant-scoped run (by
+    the caller, via the existing _get_*_run_or_404 helpers) -> validate
+    downloadable state -> reject an already-purged artifact (Module 13:
+    output_deleted_at IS NOT NULL, a single-shot "purged" audit row,
+    410) -> resolve and contain path -> create started audit row ->
+    open and verify the full artifact (this single open() call also
+    resolves file-existence/regular-file, folded into the same attempt
+    rather than a separate stat -- see app.artifacts.download) -> begin
     streaming only after a confirmed hash match -> finalize the audit
     outcome once the transfer completes or fails.
 
@@ -1681,6 +1683,36 @@ def _download_artifact(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Cannot download an artifact with status '{run.status}'",
+        )
+
+    if run.output_deleted_at is not None:
+        # Module 13: the artifact was already removed by the retention
+        # module. This is checked before any path resolution or storage
+        # access -- resolve_artifact_path() and ArtifactStorage.open() are
+        # never reached for a purged artifact, since there is nothing on
+        # disk to resolve or open. Written directly as a single-shot
+        # terminal row (outcome="purged", no failure_reason_code, never a
+        # 'started'-then-finalized transition) -- see
+        # ArtifactDownloadEvent's own docstring for why this differs from
+        # the file_missing/integrity_failed/stream_failed lifecycle below.
+        # The response carries no filesystem path, no output_deleted_at
+        # value, and no internal error detail -- only a short, generic
+        # message.
+        purged_event = ArtifactDownloadEvent(
+            id=uuid.uuid4(),
+            organization_id=current_user.organization_id,
+            artifact_type=artifact_type,
+            downloaded_by=current_user.id,
+            run_status_at_request=run.status,
+            outcome="purged",
+            failure_reason_code=None,
+            completed_at=datetime.now(timezone.utc),
+            **{_ARTIFACT_RUN_ID_FIELDS[artifact_type]: run.id},
+        )
+        db.add(purged_event)
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE, detail="Artifact no longer available"
         )
 
     tenant_root = Path(

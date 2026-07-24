@@ -23,3 +23,4 @@ from app.models.match_skipped_block import MatchSkippedBlock  # noqa: F401
 from app.models.export_run import ExportRun  # noqa: F401
 from app.models.export_row_exclusion import ExportRowExclusion  # noqa: F401
 from app.models.artifact_download_event import ArtifactDownloadEvent  # noqa: F401
+from app.models.artifact_retention_event import ArtifactRetentionEvent  # noqa: F401

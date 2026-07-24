@@ -12,6 +12,7 @@ test file in this suite builds its own self-contained pipeline
 helpers rather than importing another file's)."""
 import hashlib
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -697,6 +698,188 @@ def test_failure_after_verification_before_streaming_records_stream_failed(
         # is still recorded.
         assert events[0].verified_sha256 is not None
         assert events[0].completed_at is not None
+    finally:
+        get_settings.cache_clear()
+
+
+# --- purged artifact (Module 13 Phase 4) ----------------------------------
+
+
+def test_download_purged_export_artifact_returns_410_and_records_purged_event(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        client.post(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/approve",
+            headers=headers,
+        )
+        export_run = _load_export_run(db_session, ids["export_run_id"])
+        export_run.output_deleted_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        response = client.get(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/download",
+            headers=headers,
+        )
+        assert response.status_code == 410, response.text
+        assert response.json()["detail"] == "Artifact no longer available"
+
+        db_session.expire_all()
+        events = _events_for_export_run(db_session, ids["export_run_id"])
+        assert len(events) == 1
+        assert events[0].outcome == "purged"
+        assert events[0].artifact_type == "export"
+        assert events[0].failure_reason_code is None
+        assert events[0].bytes_served == 0
+        assert events[0].verified_sha256 is None
+        assert events[0].completed_at is not None
+        assert events[0].run_status_at_request == "approved"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_download_purged_cleaning_artifact_returns_410_and_records_purged_event(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        cleaning_run = _load_cleaning_run(db_session, ids["clean_run_id"])
+        cleaning_run.output_deleted_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        response = client.get(
+            f"/tasks/{ids['clean_task_id']}/runs/{ids['clean_run_id']}/cleaning/download",
+            headers=headers,
+        )
+        assert response.status_code == 410, response.text
+
+        db_session.expire_all()
+        events = list(
+            db_session.execute(
+                select(ArtifactDownloadEvent).where(
+                    ArtifactDownloadEvent.cleaning_run_id == cleaning_run.id
+                )
+            ).scalars().all()
+        )
+        assert len(events) == 1
+        assert events[0].outcome == "purged"
+        assert events[0].artifact_type == "cleaning"
+        assert events[0].failure_reason_code is None
+        assert events[0].completed_at is not None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_download_purged_standardization_artifact_returns_410_and_records_purged_event(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        std_run = _load_standardization_run(db_session, ids["std_run_id"])
+        std_run.output_deleted_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        response = client.get(
+            f"/tasks/{ids['std_task_id']}/runs/{ids['std_run_id']}/standardization/download",
+            headers=headers,
+        )
+        assert response.status_code == 410, response.text
+
+        db_session.expire_all()
+        events = list(
+            db_session.execute(
+                select(ArtifactDownloadEvent).where(
+                    ArtifactDownloadEvent.standardization_run_id == std_run.id
+                )
+            ).scalars().all()
+        )
+        assert len(events) == 1
+        assert events[0].outcome == "purged"
+        assert events[0].artifact_type == "standardization"
+        assert events[0].failure_reason_code is None
+        assert events[0].completed_at is not None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_download_purged_response_never_exposes_path_or_deleted_at(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        client.post(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/approve",
+            headers=headers,
+        )
+        export_run = _load_export_run(db_session, ids["export_run_id"])
+        deleted_at = datetime.now(timezone.utc)
+        export_run.output_deleted_at = deleted_at
+        db_session.commit()
+        output_path = str(export_run.output_file_path)
+
+        response = client.get(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/download",
+            headers=headers,
+        )
+        assert response.status_code == 410, response.text
+        body_text = response.text
+        assert output_path not in body_text
+        assert str(export_run.id) not in body_text or "detail" in response.json()
+        # The generic message only -- no ISO timestamp, no path fragment,
+        # no internal exception text of any kind.
+        assert response.json() == {"detail": "Artifact no longer available"}
+        for header_value in response.headers.values():
+            assert output_path not in header_value
+    finally:
+        get_settings.cache_clear()
+
+
+def test_download_purged_check_precedes_path_resolution_and_storage_access(
+    client: TestClient, db_session, tmp_path: Path, monkeypatch
+) -> None:
+    """Regression test for the exact ordering this phase's instructions
+    require: a purged artifact must be rejected before
+    resolve_artifact_path or ArtifactStorage.open is ever reached. Proven
+    here by monkeypatching resolve_artifact_path (as imported into
+    app.api.tasks) to raise if called at all -- if the 410 branch is ever
+    reordered to run after path resolution, this test fails loudly
+    instead of silently passing for the wrong reason."""
+    csv_root = _set_roots(monkeypatch, tmp_path)
+    try:
+        headers = _auth_headers(client, uuid.uuid4().hex)
+        ids = _build_pipeline(client, db_session, csv_root, headers)
+        client.post(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/approve",
+            headers=headers,
+        )
+        export_run = _load_export_run(db_session, ids["export_run_id"])
+        export_run.output_deleted_at = datetime.now(timezone.utc)
+        db_session.commit()
+
+        import app.api.tasks as tasks_module
+
+        def _must_not_be_called(*args, **kwargs):
+            raise AssertionError(
+                "resolve_artifact_path was called for a purged artifact -- "
+                "the 410 check must short-circuit before this point"
+            )
+
+        monkeypatch.setattr(tasks_module, "resolve_artifact_path", _must_not_be_called)
+
+        response = client.get(
+            f"/tasks/{ids['export_task_id']}/runs/{ids['export_run_id']}/export/download",
+            headers=headers,
+        )
+        assert response.status_code == 410, response.text
     finally:
         get_settings.cache_clear()
 
