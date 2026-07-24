@@ -37,9 +37,11 @@ from app.models.cleaning_change import CleaningChange
 from app.models.cleaning_run import CleaningRun
 from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
-from app.models.enums import TaskType
+from app.models.enums import ISSUE_SEVERITIES, ISSUE_TYPES, TaskType
 from app.models.export_row_exclusion import ExportRowExclusion
 from app.models.export_run import ExportRun
+from app.models.issue import Issue
+from app.models.issue_detection_run import IssueDetectionRun
 from app.models.match_decision import MatchDecision
 from app.models.match_group import MatchGroup
 from app.models.match_rule_field import MatchRuleField
@@ -60,6 +62,8 @@ from app.schemas.cleaning_run import CleaningRunRead
 from app.schemas.data_profile import DataProfileRead
 from app.schemas.export_row_exclusion import ExportRowExclusionRead
 from app.schemas.export_run import ExportRunRead
+from app.schemas.issue import IssueRead
+from app.schemas.issue_detection_run import IssueDetectionRunRead
 from app.schemas.match_decision import MatchDecisionRead
 from app.schemas.match_group import MatchGroupRead
 from app.schemas.match_rule_set import MatchRuleSetCreate, MatchRuleSetRead
@@ -1873,3 +1877,178 @@ def download_task_run_export(
     CSV. Same behavior/status codes as download_task_run_cleaning."""
     export_run = _get_export_run_or_404(db, task_id, run_id, current_user.organization_id)
     return _download_artifact(db, current_user, "export", export_run)
+
+
+# --- Module 14 Phase 3: Issue Detection API ---------------------------------
+#
+# Read-only orchestration only -- this router never imports or calls
+# anything from app.detection (the pure engine) or
+# app.worker.handlers.issue_detection. Both endpoints below do nothing
+# more than look up rows the worker already wrote (see
+# app.worker.handlers.issue_detection.IssueDetectionHandler) and shape
+# them into response DTOs; all detection business logic already ran
+# inside the worker, synchronously, before either endpoint is ever
+# called (Phase 3 correction #6 -- no async behavior is introduced here,
+# and none is needed).
+#
+# Neither endpoint returns a SQLAlchemy model (Phase 3 correction #2):
+# the summary endpoint returns IssueDetectionRunRead, itself built via
+# Pydantic's from_attributes off the ORM row (schema-level DTO
+# conversion, not the raw ORM object); the detail endpoint builds each
+# IssueRead explicitly, field by field, including the joined-in
+# dataset_id (see app.schemas.issue's own docstring).
+
+
+def _get_issue_detection_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> IssueDetectionRun:
+    """Shared 404 chain for every detection-result endpoint: task visible
+    -> run visible -> detection result exists. Direct mirror of
+    _get_cleaning_run_or_404 / _get_match_run_or_404."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    run_exists = db.execute(
+        select(TaskRun.id).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if run_exists is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    detection_run = db.execute(
+        select(IssueDetectionRun).where(
+            IssueDetectionRun.task_run_id == run_id,
+            IssueDetectionRun.task_id == task.id,
+            IssueDetectionRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if detection_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Issue detection result not found"
+        )
+    return detection_run
+
+
+@router.get("/{task_id}/runs/{run_id}/detection", response_model=IssueDetectionRunRead)
+def get_task_run_detection(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> IssueDetectionRun:
+    """Module 14: the summary result of a DETECT TaskRun -- scan counts,
+    total_issues_found/persisted_issue_count, and the issues_by_severity/
+    issues_by_type breakdowns. Phase 3 correction #5: this is the entire
+    handler -- one row already computed by the worker is fetched and
+    returned; no Issue row is ever loaded to answer this request. 404 if
+    the run isn't visible to this org or no detection result exists yet
+    (e.g. the run hasn't completed, or wasn't a DETECT run)."""
+    return _get_issue_detection_run_or_404(db, task_id, run_id, current_user.organization_id)
+
+
+# Query-param name -> Issue column, the single place a future filter is
+# added (Phase 3 correction #4: "future filters can be added without
+# rewriting endpoints"). list_task_run_detection_issues below only ever
+# loops over this mapping -- adding a new filterable field is one new
+# entry here plus one new typed Query(...) parameter on the endpoint
+# signature (FastAPI/OpenAPI need an explicit, documented parameter per
+# filter), never a change to the WHERE-building logic itself.
+_ISSUE_FILTER_COLUMNS = {
+    "severity": Issue.severity,
+    "issue_type": Issue.issue_type,
+    "column_name": Issue.column_name,
+    "row_number": Issue.row_number,
+}
+
+
+def _apply_issue_filters(filters: list, **filter_values) -> list:
+    for name, value in filter_values.items():
+        if value is not None:
+            filters.append(_ISSUE_FILTER_COLUMNS[name] == value)
+    return filters
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/detection/issues",
+    response_model=PaginatedResponse[IssueRead],
+)
+def list_task_run_detection_issues(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    severity: str | None = Query(default=None),
+    issue_type: str | None = Query(default=None),
+    column_name: str | None = Query(default=None),
+    row_number: int | None = Query(default=None, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[IssueRead]:
+    """Module 14: the bounded per-finding list for a detection run, in
+    row order -- same server-side limit/offset pagination shape as every
+    other *_changes/*_decisions list endpoint (Phase 3 correction #3: full
+    result sets are never returned in one response; PaginationParams caps
+    `limit` at 100). Filterable by severity, issue_type, column_name, and
+    row_number (Phase 3 correction #4), individually or combined -- see
+    _ISSUE_FILTER_COLUMNS. Note this may under-represent
+    total_issues_found on IssueDetectionRun for a run whose finding
+    volume exceeded ISSUE_DETECTION_MAX_PERSISTED_ISSUES; the aggregate
+    counts on the parent IssueDetectionRun (surfaced via GET
+    .../detection) are always accurate even when the per-issue rows here
+    are capped."""
+    detection_run = _get_issue_detection_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    if severity is not None and severity not in ISSUE_SEVERITIES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"severity must be one of {ISSUE_SEVERITIES}",
+        )
+    if issue_type is not None and issue_type not in ISSUE_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"issue_type must be one of {ISSUE_TYPES}",
+        )
+
+    filters = [
+        Issue.detection_run_id == detection_run.id,
+        Issue.organization_id == current_user.organization_id,
+    ]
+    _apply_issue_filters(
+        filters,
+        severity=severity,
+        issue_type=issue_type,
+        column_name=column_name,
+        row_number=row_number,
+    )
+
+    total = db.execute(select(func.count()).select_from(Issue).where(*filters)).scalar_one()
+    rows = db.execute(
+        select(Issue)
+        .where(*filters)
+        .order_by(Issue.row_number, Issue.id)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    items = [
+        IssueRead(
+            id=row.id,
+            detection_run_id=row.detection_run_id,
+            dataset_id=detection_run.data_source_id,
+            row_number=row.row_number,
+            column_name=row.column_name,
+            issue_type=row.issue_type,
+            severity=row.severity,
+            original_value=row.original_value,
+            suggested_fix=row.suggested_fix,
+            confidence=row.confidence,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+    return PaginatedResponse(
+        items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )

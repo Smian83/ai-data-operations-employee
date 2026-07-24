@@ -742,7 +742,64 @@ filesystem issue is needed. A manual, on-demand retention-trigger API
 endpoint was considered during design but was never approved and does
 not exist -- retention only ever runs on its worker-loop timer.
 
-## Health Endpoint
+## Issue Detection Engine (Module 14)
+
+A completely deterministic, strictly **read-only** data-quality scanner.
+`IssueDetectionHandler` (`TaskType.DETECT`) reads a data source's raw
+synced CSV -- the same file Module 5 profiles, before and independent of
+any Module 6/7 cleaning or standardization -- and produces structured
+`Issue` findings. **It never modifies, corrects, or infers a replacement
+for a single source value.** No AI/LLM is used anywhere in the detection
+path; every check is a pure, named rule with a fixed, explainable
+severity and confidence.
+
+**Eighteen issue types** (`app/detection/issue_types.py`): missing/empty/
+null value, duplicate row, duplicate primary key, invalid email/phone/
+date/numeric, required-field violation, leading/trailing whitespace,
+multiple internal spaces, inconsistent capitalization, boolean
+inconsistency, invalid enum value, outlier, and broken FK reference. The
+last is registered but a permanent no-op in this release -- see Known
+Limitations in `PROJECT_CONTEXT.md`. Severities are `INFO`/`LOW`/
+`MEDIUM`/`HIGH`/`CRITICAL`.
+
+**Nothing runs unless explicitly configured.** Format checks
+(email/phone/date/numeric/boolean), `is_required`, `is_primary_key`,
+`allowed_values`, outlier detection, and inconsistent-capitalization
+detection all require an explicit `IssueDetectionColumnRule` row for that
+column -- a column's name or contents are never used to guess its
+meaning. Rules may be scoped to one `data_source_id` or organization-wide
+(`data_source_id IS NULL`); a data-source-specific rule always wins over
+an org-wide one for the same column. Only whitespace checks run
+unconditionally. There is no CRUD API for these rules yet -- insert rows
+directly (same pre-API state `standardization_column_mappings` had after
+Module 7 Phase 1).
+
+**Configuration.** `ISSUE_DETECTION_MAX_PERSISTED_ISSUES` (default
+`10,000`) caps how many `Issue` rows one run persists -- the parent
+`IssueDetectionRun.total_issues_found`/`issues_by_severity`/
+`issues_by_type` are always the true, uncapped counts even when detail
+rows are capped. `ISSUE_DETECTION_OUTLIER_ZSCORE_THRESHOLD` (default
+`3.5`) is the fallback modified z-score threshold (median/MAD, Iglewicz &
+Hoaglin method) used when a column's own
+`outlier_zscore_threshold` is unset.
+
+**API.**
+`GET /tasks/{task_id}/runs/{run_id}/detection` returns the run summary --
+scan counts and the true `issues_by_severity`/`issues_by_type` totals --
+computed once by the worker and read back as-is; no `Issue` row is loaded
+to answer this request. `GET /tasks/{task_id}/runs/{run_id}/detection/issues`
+returns the bounded, paginated finding list (`limit`/`offset`, same
+convention as every other list endpoint, `limit` capped at 100),
+filterable by `severity`, `issue_type`, `column_name`, and `row_number`,
+individually or combined. Every returned `Issue` includes `dataset_id`
+(the data source it was found in), even though that is not a column on
+the underlying table -- it is joined in from the parent run. Neither
+endpoint modifies anything or calls into the detection engine directly;
+detection already ran, once, inside the worker.
+
+**No approval workflow.** Unlike every module since 6, `IssueDetectionRun`
+has no `pending_review`/`approved`/`rejected`/`rolled_back` state --
+nothing was changed, so there is nothing to approve or roll back.
 
 ## Health Endpoint
 
