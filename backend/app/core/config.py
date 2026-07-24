@@ -304,6 +304,32 @@ class Settings(BaseSettings):
         default=False, alias="OUTPUT_RETENTION_DRY_RUN"
     )
 
+    # --- Issue detection engine (Module 14) ---
+    # No csv_*_root setting -- the engine only ever reads the existing
+    # tenant-scoped CSV_INPUT_ROOT file (the same raw synced source
+    # app.profiling.csv_loader already reads for Module 5), never writes
+    # anywhere. See app.worker.handlers.issue_detection.
+    #
+    # Caps individual Issue rows persisted per run; same bounded-but-
+    # never-silent pattern as CLEANING_MAX_PERSISTED_CHANGES/
+    # STANDARDIZATION_MAX_PERSISTED_CHANGES/MATCH_MAX_PERSISTED_DECISIONS/
+    # EXPORT_MAX_PERSISTED_EXCLUSIONS -- IssueDetectionRun.total_issues_found
+    # and .issues_by_severity/.issues_by_type are always the true totals
+    # even when this is capped.
+    issue_detection_max_persisted_issues: int = Field(
+        default=10_000, alias="ISSUE_DETECTION_MAX_PERSISTED_ISSUES", gt=0
+    )
+    # Global default for the modified z-score (median/MAD) outlier check --
+    # only applied to a column when IssueDetectionColumnRule.outlier_enabled
+    # is true for it (see that model's docstring: never inferred from a
+    # column's name or data). A column may override this via its own
+    # outlier_zscore_threshold; NULL there falls back to this setting.
+    # 3.5 is the conventional Iglewicz & Hoaglin modified-z-score threshold
+    # for this method, not an arbitrary guess.
+    issue_detection_outlier_zscore_threshold: float = Field(
+        default=3.5, alias="ISSUE_DETECTION_OUTLIER_ZSCORE_THRESHOLD", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

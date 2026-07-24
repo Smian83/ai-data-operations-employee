@@ -174,6 +174,13 @@ class TaskRun(Base):
     data_profile: Mapped["DataProfile | None"] = relationship(  # noqa: F821
         back_populates="task_run", uselist=False
     )
+    # Module 14: at most one immutable detection summary per run (enforced
+    # by uq_issue_detection_runs_task_run_id at the database layer). Same
+    # shape as data_profile above -- both are read-only diagnostic
+    # snapshots, never approval-gated outputs.
+    issue_detection_run: Mapped["IssueDetectionRun | None"] = relationship(  # noqa: F821
+        back_populates="task_run", uselist=False
+    )
 
     def __repr__(self) -> str:
         return f"TaskRun(id={self.id!r}, task={self.task_id!r}, status={self.status!r})"

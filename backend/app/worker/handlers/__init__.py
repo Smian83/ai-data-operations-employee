@@ -43,11 +43,27 @@ source_task_run_id or fails permanently (see ExportHandler.execute).
 ExportHandler is the first handler since StandardizationHandler to write
 a real output file -- see
 docs/module-9-data-export-engine-design.md Section 2. OTHER remains on
-NoOpHandler until its own follow-up module, if ever."""
+NoOpHandler until its own follow-up module, if ever.
+
+Module 14 Phase 1 update: another NEW TaskType value, DETECT, was
+registered on NoOpHandler temporarily -- same placeholder pattern
+OTHER/EXPORT/STANDARDIZE/MATCH all passed through before their own real
+handler existed, keeping test_registry_has_a_handler_for_every_task_type
+(tests/test_worker_handlers.py) green while Module 14's database layer
+(models/migration/config only) landed ahead of its worker handler and
+API, by explicit, approved phase-scoping.
+
+Module 14 Phase 2 update: DETECT now maps to the real
+IssueDetectionHandler, replacing that placeholder -- the same
+purely-in-place swap Module 9 performed for EXPORT's own NoOpHandler
+placeholder. A Task with task_type=DETECT now executes real,
+strictly-read-only issue-detection logic against the data source's raw
+synced CSV instead of a no-op (see IssueDetectionHandler.execute)."""
 from app.models.enums import TaskType
 from app.worker.handlers.base import ExecutionHandler
 from app.worker.handlers.cleaning import CleaningHandler
 from app.worker.handlers.export import ExportHandler
+from app.worker.handlers.issue_detection import IssueDetectionHandler
 from app.worker.handlers.matching import MatchHandler
 from app.worker.handlers.csv_profiling import CsvProfilingHandler
 from app.worker.handlers.noop import NoOpHandler
@@ -60,6 +76,7 @@ HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.OTHER: NoOpHandler(),
     TaskType.STANDARDIZE: StandardizationHandler(),
     TaskType.MATCH: MatchHandler(),
+    TaskType.DETECT: IssueDetectionHandler(),
 }
 
 

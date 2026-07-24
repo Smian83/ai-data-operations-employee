@@ -24,3 +24,6 @@ from app.models.export_run import ExportRun  # noqa: F401
 from app.models.export_row_exclusion import ExportRowExclusion  # noqa: F401
 from app.models.artifact_download_event import ArtifactDownloadEvent  # noqa: F401
 from app.models.artifact_retention_event import ArtifactRetentionEvent  # noqa: F401
+from app.models.issue_detection_run import IssueDetectionRun  # noqa: F401
+from app.models.issue import Issue  # noqa: F401
+from app.models.issue_detection_column_rule import IssueDetectionColumnRule  # noqa: F401
