@@ -76,6 +76,16 @@ class ValidationRun(Base):
             name="fk_validation_runs_org_remediation_run",
             ondelete="RESTRICT",
         ),
+        # The APPLY_REMEDIATIONS run whose materialized artifact was the
+        # source for this validation run. Nullable: rows written before
+        # APPLY_REMEDIATIONS existed have no linked AppliedRemediationRun.
+        # RESTRICT: same audit-preservation reasoning as remediation_run_id.
+        ForeignKeyConstraint(
+            ["organization_id", "applied_remediation_run_id"],
+            ["applied_remediation_runs.organization_id", "applied_remediation_runs.id"],
+            name="fk_validation_runs_org_applied_remediation_run",
+            ondelete="RESTRICT",
+        ),
         # Idempotency gate: one ValidationRun per VALIDATE TaskRun, same as
         # IssueDetectionRun and RemediationRun. IntegrityError on duplicate
         # task_run_id triggers the handler's catch-and-refetch path.
@@ -124,6 +134,14 @@ class ValidationRun(Base):
     # lookup of RemediationRun, then stored here for efficient run-scoped
     # queries without an extra join back through task_runs.
     remediation_run_id: Mapped[uuid.UUID] = mapped_column(Uuid(), nullable=False, index=True)
+
+    # The APPLY_REMEDIATIONS run that materialized the artifact validated here.
+    # Nullable: pre-existing ValidationRun rows (from before APPLY_REMEDIATIONS
+    # was introduced) have no linked AppliedRemediationRun. Set by
+    # ValidationHandler when it chains from an AppliedRemediationRun.
+    applied_remediation_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), nullable=True, index=True
+    )
 
     # How many approved RemediationChange rows were in the snapshot at the
     # start of this run (Adjustment 1: snapshot frozen once, never re-read).

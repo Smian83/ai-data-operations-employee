@@ -70,6 +70,27 @@ class TaskType(str, enum.Enum):
     # (same placeholder pattern DETECT/REMEDIATE/VALIDATE each passed through).
     # See docs/module-18-quality-control-engine-design.md.
     QUALITY_CTRL = "quality_ctrl"
+    # Module 19: another new value, same reasoning as DETECT/REMEDIATE/
+    # VALIDATE/QUALITY_CTRL -- every existing value already means something
+    # specific. CLEAN_EXPORT consumes the completed QualityControlRun produced
+    # by Module 18 and materializes an immutable, verified, downloadable
+    # artifact (CSV or XLSX) from the approved Module 9 ExportRun. Unlike
+    # prior "read-only" modules (DETECT/REMEDIATE/VALIDATE/QUALITY_CTRL),
+    # CLEAN_EXPORT writes an output file -- the final, approved clean export.
+    # It never modifies source data, never overwrites the Module 9 ExportRun
+    # artifact, and only proceeds when the QualityControlRun recommendation is
+    # PASS or PASS_WITH_WARNINGS.
+    CLEAN_EXPORT = "clean_export"
+    # APPLY_REMEDIATIONS: a new value bridging Module 16 (approval decisions)
+    # and Module 17 (validation). Reads the approved Module 9 ExportRun
+    # artifact, applies only the approved RemediationChange proposals from
+    # Module 15 (filtered through Module 16 decisions), and materializes an
+    # immutable remediated CSV to csv_remediated_root. Unlike REMEDIATE
+    # (which only proposes changes) and VALIDATE (which only reads DB rows),
+    # APPLY_REMEDIATIONS is the first module to actually materialize a
+    # post-remediation dataset on disk. It never modifies the ExportRun
+    # artifact or any upstream row.
+    APPLY_REMEDIATIONS = "apply_remediations"
 
 
 class TaskRunStatus(str, enum.Enum):
@@ -322,3 +343,31 @@ assert len(QUALITY_RELEASE_RECOMMENDATIONS) == 3, (
     "QUALITY_RELEASE_RECOMMENDATIONS must have 3 entries"
 )
 assert len(QUALITY_CATEGORY_STATUSES) == 4, "QUALITY_CATEGORY_STATUSES must have 4 entries"
+
+
+# Module 19: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as every closed vocabulary above, applied to the clean
+# export engine's own per-export lifecycle states. See
+# docs/module-19-clean-export-engine-design.md.
+#
+# Lifecycle:
+#   pending    → export created, not yet processed (async path only)
+#   processing → export actively running
+#   completed  → artifact written, checksum stored, ready for download
+#   failed     → export attempt failed (see failure_reason column)
+#   blocked    → dataset ineligible: approval/validation/QC check failed
+#   expired    → artifact deleted by retention policy; metadata remains
+CLEAN_EXPORT_STATUSES = (
+    "pending",
+    "processing",
+    "completed",
+    "failed",
+    "blocked",
+    "expired",
+)
+
+# Two supported output formats for clean exports (CSV and XLSX).
+CLEAN_EXPORT_FORMATS = ("csv", "xlsx")
+
+assert len(CLEAN_EXPORT_STATUSES) == 6, "CLEAN_EXPORT_STATUSES must have 6 entries"
+assert len(CLEAN_EXPORT_FORMATS) == 2, "CLEAN_EXPORT_FORMATS must have 2 entries"

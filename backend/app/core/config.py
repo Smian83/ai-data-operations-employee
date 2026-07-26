@@ -377,6 +377,30 @@ class Settings(BaseSettings):
         default=10_000, alias="QUALITY_MAX_PERSISTED_FINDINGS", gt=0
     )
 
+    # --- Clean export engine (Module 19) ---
+    # Clean export artifacts are written under this tenant-scoped root
+    # ({CLEAN_EXPORT_OUTPUT_ROOT}/{organization_id}/{artifact_id}.{format}),
+    # completely distinct from all prior output roots (CSV_INPUT_ROOT,
+    # CSV_OUTPUT_ROOT, CSV_STANDARDIZED_ROOT, CSV_EXPORTED_ROOT). The Module 9
+    # ExportRun artifact being re-exported is NEVER opened for writing
+    # anywhere in this module -- Module 19 only reads the existing ExportRun
+    # CSV, converts it to the requested format, and writes to this new root.
+    # See docs/module-19-clean-export-engine-design.md Section 2.
+    clean_export_output_root: str = Field(
+        default="./data/clean_exports", alias="CLEAN_EXPORT_OUTPUT_ROOT"
+    )
+
+    # --- APPLY_REMEDIATIONS engine ---
+    # Remediated output CSVs are written under this tenant-scoped root
+    # (CSV_REMEDIATED_ROOT/{organization_id}/{task_run_id}.csv), distinct from
+    # ALL prior output roots. APPLY_REMEDIATIONS reads the ExportRun artifact
+    # (CSV_EXPORTED_ROOT), applies only approved RemediationChange proposals,
+    # and writes to this new root. The ExportRun artifact is NEVER opened for
+    # writing anywhere in this module. See ApprovedChangesApplicatorHandler.
+    csv_remediated_root: str = Field(
+        default="./data/csv_remediated", alias="CSV_REMEDIATED_ROOT"
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

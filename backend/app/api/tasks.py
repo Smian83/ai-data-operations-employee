@@ -63,6 +63,7 @@ from app.models.remediation_change_decision import RemediationChangeDecision
 from app.models.remediation_run import RemediationRun
 from app.models.quality_control_run import QualityControlRun
 from app.models.quality_finding import QualityFinding
+from app.models.clean_export import CleanExport
 from app.models.validation_result import ValidationResult
 from app.models.validation_run import ValidationRun
 from app.models.standardization_change import StandardizationChange
@@ -74,6 +75,8 @@ from app.models.task_run import TaskRun
 from app.models.task_run_event import TaskRunEvent
 from app.models.user import User
 from app.services.task_run_factory import create_task_run_record
+from app.clean_export.service import ExportService
+from app.clean_export.types import CleanExportRequest
 from app.schemas.cleaning_change import CleaningChangeRead
 from app.schemas.cleaning_run import CleaningRunRead
 from app.schemas.data_profile import DataProfileRead
@@ -93,6 +96,7 @@ from app.schemas.remediation import (
     RemediationRunRead,
 )
 from app.schemas.quality_control import QualityControlRunRead, QualityFindingRead
+from app.schemas.clean_export import CleanExportCreate, CleanExportRead
 from app.schemas.validation import ValidationResultRead, ValidationRunRead
 from app.schemas.match_skipped_block import MatchSkippedBlockRead
 from app.schemas.pagination import PaginatedResponse
@@ -3162,4 +3166,221 @@ def list_task_run_quality_control_findings(
 
     return PaginatedResponse(
         items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+# =============================================================================
+# Module 19: Clean Export Engine -- 4 endpoints
+#
+#   POST   /{task_id}/exports          create (and run) a clean export
+#   GET    /{task_id}/exports          list clean exports for a job
+#   GET    /exports/{export_id}        get a single clean export (global ID)
+#   GET    /exports/{export_id}/download stream the export artifact
+#
+# "job_id" in the spec maps to task_id in this project (Tasks ARE jobs).
+# Export is run synchronously: POST returns the completed CleanExport row
+# (status=completed, failed, or blocked) once ExportService finishes.
+# =============================================================================
+
+_export_service = ExportService()
+
+
+@router.post(
+    "/{task_id}/exports",
+    response_model=CleanExportRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_clean_export(
+    task_id: uuid.UUID,
+    payload: CleanExportCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> CleanExport:
+    """Module 19: Create and run a clean export for an approved, quality-controlled dataset.
+
+    Returns a CleanExport with status='completed', 'blocked', or 'failed'.
+
+    Idempotent: supplying the same idempotency_key on a second call returns
+    the existing CleanExport row without re-running the export pipeline.
+
+    status='blocked' means the dataset is ineligible (no approved ExportRun or
+    no PASS/PASS_WITH_WARNINGS QualityControlRun); see failure_reason for details.
+    """
+    # Resolve Task to get data_source_id; 404 on missing/inactive.
+    task = _get_active_task_or_404(db, task_id, current_user.organization_id)
+    if task.data_source_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Task has no associated data source; cannot create a clean export.",
+        )
+
+    request = CleanExportRequest(
+        organization_id=current_user.organization_id,
+        job_id=task_id,
+        data_source_id=task.data_source_id,
+        format=payload.format,
+        idempotency_key=payload.idempotency_key,
+        dataset_version=payload.dataset_version,
+    )
+    clean_export = _export_service.run(db, request)
+    return clean_export
+
+
+@router.get(
+    "/{task_id}/exports",
+    response_model=PaginatedResponse[CleanExportRead],
+)
+def list_clean_exports(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+    pagination: PaginationParams = Depends(),
+) -> PaginatedResponse:
+    """Module 19: List all clean exports for a job (task), newest first.
+
+    Includes exports in all statuses (completed, blocked, failed, etc.).
+    404 if the task does not exist or is not active.
+    """
+    _get_active_task_or_404(db, task_id, current_user.organization_id)
+
+    from app.clean_export.repository import ExportRepository as _ExportRepo
+    _repo = _ExportRepo()
+    items = _repo.list_by_job(
+        db,
+        job_id=task_id,
+        organization_id=current_user.organization_id,
+        limit=pagination.limit,
+        offset=pagination.offset,
+    )
+    total = _repo.count_by_job(db, task_id, current_user.organization_id)
+    return PaginatedResponse(
+        items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+@router.get(
+    "/exports/{export_id}",
+    response_model=CleanExportRead,
+)
+def get_clean_export(
+    export_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> CleanExport:
+    """Module 19: Get a single CleanExport by export_id.
+
+    Organization-scoped: 404 if export_id belongs to a different org.
+    """
+    from app.clean_export.repository import ExportRepository as _ExportRepo2
+    _repo2 = _ExportRepo2()
+    export = _repo2.get_by_id(db, export_id, current_user.organization_id)
+    if export is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Clean export not found",
+        )
+    return export
+
+
+@router.get("/exports/{export_id}/download")
+def download_clean_export(
+    export_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """Module 19: Download the clean export artifact.
+
+    Only available for status='completed' exports. Returns a streaming
+    response with the artifact bytes after SHA-256 integrity verification
+    (same verify-then-stream pattern as Module 10).
+
+    404 if the export is not found.
+    409 if the export is not in 'completed' status.
+    410 if the artifact was deleted by retention (status='expired').
+    500 on file-not-found or integrity failure.
+    """
+    from app.clean_export.repository import ExportRepository as _ExportRepo3
+    from pathlib import Path as _Path
+
+    _repo3 = _ExportRepo3()
+    export = _repo3.get_by_id(db, export_id, current_user.organization_id)
+    if export is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Clean export not found",
+        )
+
+    if export.status == "expired":
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="Clean export artifact has been deleted by retention policy",
+        )
+
+    if export.status != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Clean export is not downloadable (status={export.status!r}); "
+                "only completed exports can be downloaded"
+            ),
+        )
+
+    if export.artifact_id is None or export.checksum is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Clean export is marked completed but has no artifact_id or checksum",
+        )
+
+    _settings = get_settings()
+    _ext = "csv" if export.format == "csv" else "xlsx"
+    _artifact_path = (
+        _Path(_settings.clean_export_output_root)
+        / str(export.organization_id)
+        / f"{export.artifact_id}.{_ext}"
+    )
+    _tenant_root = (
+        _Path(_settings.clean_export_output_root) / str(export.organization_id)
+    )
+
+    try:
+        _resolved = resolve_artifact_path(_tenant_root, str(_artifact_path))
+    except ArtifactPathError:
+        logger.error(
+            "clean export download path containment violation: export_id=%s", export_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Artifact path error",
+        )
+
+    try:
+        _fileobj = open_verified_artifact(_resolved, export.checksum)
+    except ArtifactMissingError as _exc:
+        logger.error(
+            "clean export artifact missing: export_id=%s reason=%s",
+            export_id,
+            _exc.failure_reason_code,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Clean export artifact file is missing or unreadable",
+        )
+    except ArtifactIntegrityError:
+        logger.error(
+            "clean export artifact integrity failure: export_id=%s", export_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Artifact integrity verification failed; download refused",
+        )
+
+    _media_type = (
+        "text/csv" if export.format == "csv"
+        else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    _filename = f"clean-export-{export_id}.{_ext}"
+    return StreamingResponse(
+        iter_artifact_chunks(_fileobj),
+        media_type=_media_type,
+        headers={"Content-Disposition": f"attachment; filename={_filename!r}"},
     )

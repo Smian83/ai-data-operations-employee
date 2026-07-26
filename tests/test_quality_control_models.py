@@ -497,10 +497,13 @@ def test_quality_ctrl_registered_in_handler_registry():
     assert TaskType.QUALITY_CTRL in HANDLER_REGISTRY
 
 
-def test_quality_ctrl_handler_is_noop():
+def test_quality_ctrl_handler_is_real_handler():
+    """QUALITY_CTRL was a NoOpHandler placeholder in Phase 1.  It was replaced
+    by the real QualityControlHandler in Phase 3 (Module 18).  This test
+    asserts the real handler is now registered."""
     from app.worker.handlers import HANDLER_REGISTRY
-    from app.worker.handlers.noop import NoOpHandler
-    assert isinstance(HANDLER_REGISTRY[TaskType.QUALITY_CTRL], NoOpHandler)
+    from app.worker.handlers.quality_control import QualityControlHandler
+    assert isinstance(HANDLER_REGISTRY[TaskType.QUALITY_CTRL], QualityControlHandler)
 
 
 def test_handler_registry_has_entry_for_every_task_type():

@@ -862,7 +862,7 @@ def test_delete_validation_run_cascades_to_results(client, db_session):
 
 
 def test_validation_runs_live_schema_columns(db_session):
-    """validation_runs must have exactly the 13 columns defined in the ORM
+    """validation_runs must have exactly the 14 columns defined in the ORM
     model, with correct nullable flags."""
     from app.db.session import engine
 
@@ -884,6 +884,9 @@ def test_validation_runs_live_schema_columns(db_session):
         "remediation_run_id", "approved_changes_considered", "passed_count",
         "failed_count", "skipped_count", "results_by_rule",
         "validation_engine_version", "created_at",
+        # Added by APPLY_REMEDIATIONS migration (f0a1b2c3d4e5): nullable FK
+        # to applied_remediation_runs; NULL for runs that chain from REMEDIATE.
+        "applied_remediation_run_id",
     }
     assert set(live_cols.keys()) == expected, (
         f"Column mismatch on validation_runs.\n"
@@ -891,8 +894,7 @@ def test_validation_runs_live_schema_columns(db_session):
         f"  Got:      {sorted(live_cols.keys())}"
     )
 
-    for col in expected - {"created_at"}:  # created_at has a server_default
-        # All columns in validation_runs are NOT NULL
+    for col in expected - {"created_at", "applied_remediation_run_id"}:  # nullable/server_default cols
         assert live_cols[col]["notnull"], f"Column '{col}' must be NOT NULL"
 
 

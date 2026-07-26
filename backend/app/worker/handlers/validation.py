@@ -4,9 +4,15 @@ I/O. See docs/module-17-validation-engine-design.md for the full design.
 
 Algorithm (six steps, mirroring RemediationHandler's own six-step pattern):
 
-1. Resolve the upstream RemediationRun via source_task_run_id, scoped to
-   organization_id (decision 4). Missing -> permanent failure. This is the
-   only cross-table lookup before the idempotency gate.
+1. Resolve the upstream run via source_task_run_id, scoped to organization_id.
+   Two paths:
+     a. APPLY_REMEDIATIONS path (new): source_task_run_id resolves to an
+        AppliedRemediationRun. Resolve RemediationRun from
+        applied_remediation_run.remediation_run_id. Set applied_remediation_run_id
+        on the ValidationRun being created.
+     b. REMEDIATE path (legacy): source_task_run_id resolves to a RemediationRun
+        directly (no AppliedRemediationRun). applied_remediation_run_id stays NULL.
+   If neither path finds an upstream run -> permanent failure.
 
 2. Early-exit if a ValidationRun for this task_run_id already exists.
    Returns the existing summary without any further DB reads -- same pattern
@@ -61,6 +67,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal
+from app.models.applied_remediation_run import AppliedRemediationRun
 from app.models.issue_detection_column_rule import IssueDetectionColumnRule
 from app.models.remediation_change import RemediationChange
 from app.models.remediation_change_decision import RemediationChangeDecision
@@ -106,24 +113,59 @@ class ValidationHandler:
 
         db = self._session_factory()
         try:
-            # Step 1: resolve the upstream RemediationRun, scoped to this
-            # exact organization_id.  A source_task_run_id that belongs to
-            # a different organization (or does not exist at all, or was
-            # never a REMEDIATE run) is indistinguishable from "missing"
-            # here, providing the same tenant-isolation guarantee as
-            # RemediationHandler: it never leaks whether a given id exists
-            # in another organization.
-            remediation_run = db.execute(
-                select(RemediationRun).where(
-                    RemediationRun.task_run_id == source_task_run_id,
-                    RemediationRun.organization_id == organization_id,
+            # Step 1: resolve the upstream run via source_task_run_id, scoped
+            # to this exact organization_id.
+            #
+            # APPLY_REMEDIATIONS path (preferred): source_task_run_id resolves
+            # to an AppliedRemediationRun. The RemediationRun is then fetched
+            # from applied_remediation_run.remediation_run_id. This is the new
+            # pipeline: APPLY_REMEDIATIONS -> VALIDATE.
+            #
+            # REMEDIATE path (legacy): source_task_run_id resolves directly to
+            # a RemediationRun (no AppliedRemediationRun exists). Used for any
+            # VALIDATE TaskRun whose source is a raw REMEDIATE run.
+            #
+            # If neither path matches -> permanent failure (indistinguishable
+            # from a cross-org lookup, providing the same tenant-isolation
+            # guarantee as every prior handler).
+            applied_remediation_run_id: uuid.UUID | None = None
+
+            applied_remediation_run = db.execute(
+                select(AppliedRemediationRun).where(
+                    AppliedRemediationRun.task_run_id == source_task_run_id,
+                    AppliedRemediationRun.organization_id == organization_id,
                 )
             ).scalar_one_or_none()
-            if remediation_run is None:
-                raise PermanentExecutionError(
-                    "validation requires a completed remediation run for "
-                    "source_task_run_id"
-                )
+
+            if applied_remediation_run is not None:
+                # APPLY_REMEDIATIONS path: look up the RemediationRun referenced
+                # by the AppliedRemediationRun.
+                applied_remediation_run_id = applied_remediation_run.id
+                remediation_run = db.execute(
+                    select(RemediationRun).where(
+                        RemediationRun.id == applied_remediation_run.remediation_run_id,
+                        RemediationRun.organization_id == organization_id,
+                    )
+                ).scalar_one_or_none()
+                if remediation_run is None:
+                    raise PermanentExecutionError(
+                        "validation: the AppliedRemediationRun references a "
+                        "remediation_run_id that no longer exists"
+                    )
+            else:
+                # REMEDIATE (legacy) path: source_task_run_id points directly
+                # to a RemediationRun TaskRun.
+                remediation_run = db.execute(
+                    select(RemediationRun).where(
+                        RemediationRun.task_run_id == source_task_run_id,
+                        RemediationRun.organization_id == organization_id,
+                    )
+                ).scalar_one_or_none()
+                if remediation_run is None:
+                    raise PermanentExecutionError(
+                        "validation requires a completed remediation run or "
+                        "applied remediation run for source_task_run_id"
+                    )
 
             # Step 2: idempotency short-circuit -- return existing run
             # summary without any further DB reads or engine calls.
@@ -249,6 +291,9 @@ class ValidationHandler:
                 task_id=context.task.id,
                 data_source_id=data_source.id,
                 remediation_run_id=remediation_run.id,
+                # Set when chaining from APPLY_REMEDIATIONS; NULL on the
+                # legacy REMEDIATE -> VALIDATE path.
+                applied_remediation_run_id=applied_remediation_run_id,
                 approved_changes_considered=result.approved_changes_considered,
                 passed_count=result.passed_count,
                 failed_count=result.failed_count,

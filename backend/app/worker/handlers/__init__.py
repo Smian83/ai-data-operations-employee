@@ -100,6 +100,7 @@ test_registry_has_a_handler_for_every_task_type
 (models/migration/config only) lands ahead of its worker handler and API,
 by explicit, approved phase-scoping."""
 from app.models.enums import TaskType
+from app.worker.handlers.apply_remediations import ApprovedChangesApplicatorHandler
 from app.worker.handlers.base import ExecutionHandler
 from app.worker.handlers.cleaning import CleaningHandler
 from app.worker.handlers.export import ExportHandler
@@ -111,6 +112,7 @@ from app.worker.handlers.quality_control import QualityControlHandler
 from app.worker.handlers.remediation import RemediationHandler
 from app.worker.handlers.standardization import StandardizationHandler
 from app.worker.handlers.validation import ValidationHandler
+from app.worker.handlers.clean_export import CleanExportHandler
 
 HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.SYNC: CsvProfilingHandler(),
@@ -121,9 +123,24 @@ HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.MATCH: MatchHandler(),
     TaskType.DETECT: IssueDetectionHandler(),
     TaskType.REMEDIATE: RemediationHandler(),
+    # APPLY_REMEDIATIONS: new materialization step between Module 16 (approval)
+    # and Module 17 (validation). Reads the approved ExportRun artifact,
+    # applies only approved RemediationChange proposals (filtered through
+    # Module 16 RemediationChangeDecision rows), and writes an immutable
+    # remediated CSV to csv_remediated_root. Unlike REMEDIATE (proposals only),
+    # this handler DOES write an output file -- see
+    # app.worker.handlers.apply_remediations for the full algorithm.
+    TaskType.APPLY_REMEDIATIONS: ApprovedChangesApplicatorHandler(),
     TaskType.VALIDATE: ValidationHandler(),
     # Module 18 Phase 3: NoOpHandler replaced with QualityControlHandler.
     TaskType.QUALITY_CTRL: QualityControlHandler(),
+    # Module 19 Phase 3: NoOpHandler replaced with CleanExportHandler.
+    # Unlike every prior "read-only" module (DETECT/REMEDIATE/VALIDATE/
+    # QUALITY_CTRL), CLEAN_EXPORT produces a file artifact -- the final
+    # approved, quality-controlled export in CSV (default) or XLSX format.
+    # The primary trigger is the API (POST /jobs/{job_id}/exports);
+    # this handler supports worker-dispatched CLEAN_EXPORT TaskRuns.
+    TaskType.CLEAN_EXPORT: CleanExportHandler(),
 }
 
 
