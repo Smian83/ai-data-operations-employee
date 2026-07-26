@@ -512,7 +512,6 @@ def test_audit_lineage_all_keys_present() -> None:
         "applied_remediation_run_id",
         "validation_run_id",
         "quality_control_run_id",
-        "export_run_id",
         "clean_export_id",
     }
     assert set(al.keys()) == expected_keys
@@ -528,7 +527,6 @@ def test_audit_lineage_ids_match_objects() -> None:
     assert al["applied_remediation_run_id"] == str(inp.applied_remediation_run.id)
     assert al["validation_run_id"] == str(inp.validation_run.id)
     assert al["quality_control_run_id"] == str(inp.quality_control_run.id)
-    assert al["export_run_id"] == str(inp.export_run.id)
     assert al["clean_export_id"] == str(inp.clean_export.id)
 
 

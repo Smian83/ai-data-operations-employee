@@ -11,14 +11,14 @@ Design: We insert prerequisite rows directly via db_session rather than
 running all upstream handlers, to keep these tests fast and isolated.
 ReportHandler only reads those rows — it never mutates them.
 
-Scenarios covered (20):
+Scenarios covered (22):
   happy path:
     1.  Full pipeline: report_run created, quality_control_run_id populated
     2.  report_data includes all required top-level sections
     3.  executive_summary.overall_pipeline_status == 'complete'
     4.  audit_lineage IDs match the inserted ORM rows
     5.  report_engine_version / report_schema_version match constants
-    6.  generated_by defaults to str(organization_id) when no user on context
+    6.  generated_by defaults to "system" when no user on context
     7.  decision counts flow through to report_data.decisions
   idempotency:
     8.  second execute() returns 'already exists' without creating a second row
@@ -39,6 +39,10 @@ Scenarios covered (20):
    18.  data_source_id on ReportRun matches task.data_source_id
    19.  report_data is a non-empty dict
    20.  ReportRun.report_schema_version == REPORT_SCHEMA_VERSION constant
+  pipeline lineage integrity:
+   21.  audit_lineage does not contain export_run_id (Module 9 chain is not anchored)
+   22.  two independent pipeline executions for the same data source cannot mix
+        each other's CleanExport records in the report
 """
 from __future__ import annotations
 
@@ -53,6 +57,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.models.applied_remediation_run import AppliedRemediationRun
+from app.models.clean_export import CleanExport
 from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
 from app.models.enums import REPORT_ENGINE_VERSION, REPORT_SCHEMA_VERSION
@@ -394,8 +399,13 @@ def test_full_pipeline_version_constants(client, db_session) -> None:
     assert rr.report_data["report_schema_version"] == REPORT_SCHEMA_VERSION
 
 
-def test_generated_by_defaults_to_org_id(client, db_session) -> None:
-    """6. generated_by defaults to str(organization_id) when no user on context."""
+def test_generated_by_defaults_to_system(client, db_session) -> None:
+    """6. generated_by defaults to "system" when no authenticated user on context.
+
+    Storing organization_id as generated_by would be misleading — an org UUID
+    is not a human identity. The truthful value for a worker-executed run with
+    no session user is "system".
+    """
     s = uuid.uuid4().hex[:8]
     sc = _build_full_scaffold(client, db_session, s)
     ds = db_session.get(DataSource, sc["ds_id"])
@@ -405,7 +415,7 @@ def test_generated_by_defaults_to_org_id(client, db_session) -> None:
     rr = db_session.execute(
         select(ReportRun).where(ReportRun.task_run_id == sc["report_run"].id)
     ).scalar_one()
-    assert rr.report_data["generated_by"] == str(sc["org_id"])
+    assert rr.report_data["generated_by"] == "system"
 
 
 def test_decision_counts_in_report_data(client, db_session) -> None:
@@ -773,3 +783,178 @@ def test_report_schema_version_on_row(client, db_session) -> None:
         select(ReportRun).where(ReportRun.task_run_id == sc["report_run"].id)
     ).scalar_one()
     assert rr.report_schema_version == REPORT_SCHEMA_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 21-22: Pipeline lineage integrity
+# ---------------------------------------------------------------------------
+
+def test_audit_lineage_does_not_contain_export_run_id(client, db_session) -> None:
+    """21. audit_lineage must not contain export_run_id.
+
+    ExportRun is from the Module 9 MATCH→EXPORT pipeline and has no FK to
+    QualityControlRun. Including its ID in audit_lineage would falsely imply
+    it belongs to the same pipeline chain. It stays in export_result only.
+    """
+    s = uuid.uuid4().hex[:8]
+    sc = _build_full_scaffold(client, db_session, s)
+    ds = db_session.get(DataSource, sc["ds_id"])
+
+    ReportHandler().execute(_make_context(sc["report_run"], sc["report_task"], ds))
+    db_session.expire_all()
+    rr = db_session.execute(
+        select(ReportRun).where(ReportRun.task_run_id == sc["report_run"].id)
+    ).scalar_one()
+    al = rr.report_data["audit_lineage"]
+    assert "export_run_id" not in al, (
+        "audit_lineage must not contain export_run_id — ExportRun is not "
+        "part of the QC pipeline chain and cannot be anchored to it."
+    )
+
+
+def test_pipeline_lineage_isolation_two_executions(client, db_session) -> None:
+    """22. Two independent pipeline executions for the same data source cannot
+    mix each other's CleanExport records in the report.
+
+    Chain A: full pipeline + CleanExport_A (dataset_version = QCR_A.id)
+    Chain B: full pipeline + CleanExport_B (dataset_version = QCR_B.id)
+
+    Report anchored to chain A must show clean_export_id == CleanExport_A.id,
+    never CleanExport_B.id.  If the handler used "latest completed CleanExport
+    for this data_source" it would return whichever export is newer regardless
+    of which pipeline chain generated the report — a lineage integrity failure.
+    """
+    s = uuid.uuid4().hex[:8]
+
+    # ── Chain A ──────────────────────────────────────────────────────────────
+    scA = _build_full_scaffold(client, db_session, s + "A")
+    dsA = db_session.get(DataSource, scA["ds_id"])
+
+    # Insert CleanExport_A anchored to QCR_A via dataset_version.
+    ce_a = CleanExport(
+        id=uuid.uuid4(),
+        organization_id=scA["org_id"],
+        job_id=scA["report_task"].id,   # task_id of any task in this org
+        data_source_id=scA["ds_id"],
+        dataset_version=scA["qcr"].id,  # anchors to pipeline A's QC run
+        format="csv",
+        status="completed",
+        idempotency_key=uuid.uuid4().hex,
+        row_count=10,
+        column_count=3,
+    )
+    db_session.add(ce_a)
+    db_session.commit()
+
+    # ── Chain B (second execution, same org + data source) ───────────────────
+    # Re-use the same org/data-source but create a fresh complete pipeline chain.
+    headers_a = scA["headers"]
+    ds_id_str = str(scA["ds_id"])
+
+    sync_tid_b = _make_task(client, headers_a, "sync", ds_id_str, f"SyncB {s}")
+    sync_rid_b = _make_run(client, headers_a, sync_tid_b)
+    detect_tid_b = _make_task(client, headers_a, "detect", ds_id_str, f"DetectB {s}")
+    detect_rid_b = _make_run(client, headers_a, detect_tid_b)
+    rem_tid_b = _make_task(client, headers_a, "remediate", ds_id_str, f"RemB {s}")
+    rem_rid_b = _make_run(client, headers_a, rem_tid_b, source_task_run_id=detect_rid_b)
+    apply_tid_b = _make_task(client, headers_a, "apply_remediations", ds_id_str, f"ApplyB {s}")
+    apply_rid_b = _make_run(client, headers_a, apply_tid_b)
+    val_tid_b = _make_task(client, headers_a, "validate", ds_id_str, f"ValB {s}")
+    val_rid_b = _make_run(client, headers_a, val_tid_b, source_task_run_id=apply_rid_b)
+    qc_tid_b = _make_task(client, headers_a, "quality_ctrl", ds_id_str, f"QCB {s}")
+    qc_rid_b = _make_run(client, headers_a, qc_tid_b)
+    report_tid_b = _make_task(client, headers_a, "report", ds_id_str, f"ReportB {s}")
+    report_rid_b = _make_run(client, headers_a, report_tid_b)
+
+    db_session.expire_all()
+    sync_task_b = db_session.get(Task, uuid.UUID(sync_tid_b))
+    detect_task_b = db_session.get(Task, uuid.UUID(detect_tid_b))
+    rem_task_b = db_session.get(Task, uuid.UUID(rem_tid_b))
+    apply_task_b = db_session.get(Task, uuid.UUID(apply_tid_b))
+    val_task_b = db_session.get(Task, uuid.UUID(val_tid_b))
+    qc_task_b = db_session.get(Task, uuid.UUID(qc_tid_b))
+    report_task_b = db_session.get(Task, uuid.UUID(report_tid_b))
+    sync_run_b = db_session.get(TaskRun, uuid.UUID(sync_rid_b))
+    detect_run_b = db_session.get(TaskRun, uuid.UUID(detect_rid_b))
+    rem_run_b = db_session.get(TaskRun, uuid.UUID(rem_rid_b))
+    apply_run_b = db_session.get(TaskRun, uuid.UUID(apply_rid_b))
+    val_run_b = db_session.get(TaskRun, uuid.UUID(val_rid_b))
+    qc_run_b = db_session.get(TaskRun, uuid.UUID(qc_rid_b))
+    report_run_b = db_session.get(TaskRun, uuid.UUID(report_rid_b))
+
+    chain_b = _insert_full_chain(
+        db_session,
+        org_id=scA["org_id"], ds_id=scA["ds_id"],
+        sync_run=sync_run_b, detect_run=detect_run_b, remediate_run=rem_run_b,
+        apply_run=apply_run_b, validate_run=val_run_b, qc_run=qc_run_b,
+        sync_task=sync_task_b, detect_task=detect_task_b, remediate_task=rem_task_b,
+        apply_task=apply_task_b, validate_task=val_task_b, qc_task=qc_task_b,
+    )
+
+    # Wire report run B to point at QCR_B.
+    report_run_b.source_task_run_id = qc_run_b.id
+    db_session.commit()
+
+    # Insert CleanExport_B anchored to QCR_B — this is the NEWER export
+    # (same data source, same org). Without the dataset_version anchor fix,
+    # the handler would return CleanExport_B for BOTH chain A and chain B reports.
+    db_session.expire_all()
+    qcr_b = chain_b["qcr"]
+    ce_b = CleanExport(
+        id=uuid.uuid4(),
+        organization_id=scA["org_id"],
+        job_id=report_task_b.id,
+        data_source_id=scA["ds_id"],
+        dataset_version=qcr_b.id,      # anchors to pipeline B's QC run
+        format="csv",
+        status="completed",
+        idempotency_key=uuid.uuid4().hex,
+        row_count=8,
+        column_count=3,
+    )
+    db_session.add(ce_b)
+    db_session.commit()
+
+    # ── Execute chain A's report handler ─────────────────────────────────────
+    db_session.expire_all()
+    report_run_a = db_session.get(TaskRun, scA["report_run"].id)
+    report_task_a = db_session.get(Task, scA["report_task"].id)
+    ctx_a = _make_context(report_run_a, report_task_a, dsA)
+    ReportHandler().execute(ctx_a)
+
+    db_session.expire_all()
+    rr_a = db_session.execute(
+        select(ReportRun).where(ReportRun.task_run_id == report_run_a.id)
+    ).scalar_one()
+
+    # Chain A's report must show CleanExport_A, not CleanExport_B.
+    ce_a_id_str = str(ce_a.id)
+    ce_b_id_str = str(ce_b.id)
+    al_a = rr_a.report_data["audit_lineage"]
+    assert al_a["clean_export_id"] == ce_a_id_str, (
+        f"Chain A report must reference CleanExport_A ({ce_a_id_str}), "
+        f"got {al_a['clean_export_id']!r} — pipeline chains are mixing."
+    )
+    assert al_a.get("clean_export_id") != ce_b_id_str, (
+        "Chain A report incorrectly references Chain B's CleanExport."
+    )
+
+    # ── Execute chain B's report handler ─────────────────────────────────────
+    db_session.expire_all()
+    report_run_b2 = db_session.get(TaskRun, report_run_b.id)
+    ctx_b = _make_context(report_run_b2, report_task_b, dsA)
+    ReportHandler().execute(ctx_b)
+
+    db_session.expire_all()
+    rr_b = db_session.execute(
+        select(ReportRun).where(ReportRun.task_run_id == report_run_b2.id)
+    ).scalar_one()
+
+    al_b = rr_b.report_data["audit_lineage"]
+    assert al_b["clean_export_id"] == ce_b_id_str, (
+        f"Chain B report must reference CleanExport_B ({ce_b_id_str}), "
+        f"got {al_b['clean_export_id']!r} — pipeline chains are mixing."
+    )
+    assert al_b.get("clean_export_id") != ce_a_id_str, (
+        "Chain B report incorrectly references Chain A's CleanExport."
+    )

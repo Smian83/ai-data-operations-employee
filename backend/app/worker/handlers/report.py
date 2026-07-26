@@ -280,18 +280,35 @@ class ReportHandler:
                 .limit(1)
             ).scalar_one_or_none()
 
-            # Latest completed CleanExport for this data_source/task.
-            clean_export: CleanExport | None = db.execute(
-                select(CleanExport)
-                .where(
-                    CleanExport.data_source_id == data_source_id,
-                    CleanExport.organization_id == organization_id,
-                    CleanExport.job_id == task_id,
-                    CleanExport.status == "completed",
-                )
-                .order_by(CleanExport.created_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+            # CleanExport — must be anchored to the resolved pipeline chain.
+            # CleanExport.dataset_version == QualityControlRun.id is the FK that
+            # ties a clean export to exactly the QC run that authorized it. Using
+            # "latest by data_source" would allow a second pipeline execution's
+            # export to appear in this report's audit_lineage (wrong pipeline chain).
+            if quality_control_run is not None:
+                clean_export: CleanExport | None = db.execute(
+                    select(CleanExport)
+                    .where(
+                        CleanExport.dataset_version == quality_control_run.id,
+                        CleanExport.organization_id == organization_id,
+                        CleanExport.status == "completed",
+                    )
+                    .order_by(CleanExport.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
+            else:
+                # Partial pipeline (no QC run) — best-effort latest completed export
+                # for this data source.
+                clean_export = db.execute(
+                    select(CleanExport)
+                    .where(
+                        CleanExport.data_source_id == data_source_id,
+                        CleanExport.organization_id == organization_id,
+                        CleanExport.status == "completed",
+                    )
+                    .order_by(CleanExport.created_at.desc())
+                    .limit(1)
+                ).scalar_one_or_none()
 
             # CleanExport task_run is not directly recoverable without extra
             # queries; duration is omitted for clean_export stage in partial
@@ -358,9 +375,12 @@ class ReportHandler:
             task_name = task.name if task is not None else str(task_id)
 
             # User identity for "generated_by".
-            generated_by = str(context.task_run.organization_id)  # org-scoped default
+            # "system" is the truthful value when no authenticated user is present
+            # (worker-executed runs have no session user). Storing organization_id
+            # here would be misleading — an org UUID is not a human identity.
+            generated_by = "system"
             if hasattr(context, "user") and context.user is not None:
-                generated_by = getattr(context.user, "email", generated_by)
+                generated_by = getattr(context.user, "email", "system")
 
             # ── Step 7: Build report data via pure engine ──────────────────
             report_input = ReportInput(

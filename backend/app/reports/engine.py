@@ -240,6 +240,12 @@ def build_report(inp: ReportInput) -> dict[str, Any]:
         val_id = getattr(obj, "id", None)
         return str(val_id) if val_id is not None else None
 
+    # audit_lineage contains only IDs that are verifiably part of the same
+    # pipeline chain anchored by quality_control_run_id.  export_run_id is
+    # intentionally excluded: ExportRun is from the Module 9 MATCH→EXPORT
+    # pipeline and has no FK to QualityControlRun, so it cannot be anchored
+    # to the chain and would be misleading in an audit context.  It remains
+    # in the export_result section as informational context.
     audit_lineage = {
         "data_profile_id": _id(dp),
         "issue_detection_run_id": _id(idr),
@@ -247,7 +253,6 @@ def build_report(inp: ReportInput) -> dict[str, Any]:
         "applied_remediation_run_id": _id(arm),
         "validation_run_id": _id(val),
         "quality_control_run_id": _id(qcr),
-        "export_run_id": str(export_run_id) if export_run_id is not None else None,
         "clean_export_id": str(clean_export_id) if clean_export_id is not None else None,
     }
 
