@@ -330,6 +330,53 @@ class Settings(BaseSettings):
         default=3.5, alias="ISSUE_DETECTION_OUTLIER_ZSCORE_THRESHOLD", gt=0
     )
 
+    # --- Deterministic cleaning / remediation engine (Module 15) ---
+    # No csv_*_root setting here either -- like Module 14, this engine only
+    # ever re-reads the existing tenant-scoped CSV_INPUT_ROOT file (never
+    # writes anywhere; see docs/module-15-deterministic-cleaning-engine-
+    # design.md Section 1, "proposal-only, no materialized output").
+    #
+    # Caps individual RemediationChange rows persisted per run; same
+    # bounded-but-never-silent pattern as every prior *_MAX_PERSISTED_*
+    # setting -- RemediationRun.total_changes_count/.issues_skipped_count
+    # are always the true totals even when this is capped.
+    remediation_max_persisted_changes: int = Field(
+        default=10_000, alias="REMEDIATION_MAX_PERSISTED_CHANGES", gt=0
+    )
+
+    # --- Validation engine (Module 17) ---
+    # No csv_*_root setting -- like Modules 14 and 15, this engine never
+    # writes any file. It only reads approved RemediationChange rows from
+    # the database (never the source CSV) and persists ValidationResult rows.
+    #
+    # Defensive ceiling on individual ValidationResult rows persisted per
+    # run. Not expected to bind in practice -- approved changes are already
+    # bounded by REMEDIATION_MAX_PERSISTED_CHANGES upstream. Same
+    # bounded-but-never-silent pattern as every prior *_MAX_PERSISTED_*
+    # setting: ValidationRun.approved_changes_considered is always the true
+    # count from the snapshot even when this is capped; excess changes
+    # become 'skipped' results with reason PERSISTED_RESULT_LIMIT_REACHED,
+    # preserving the count invariant unconditionally.
+    validation_max_persisted_results: int = Field(
+        default=10_000, alias="VALIDATION_MAX_PERSISTED_RESULTS", gt=0
+    )
+
+    # --- Quality control engine (Module 18) ---
+    # No csv_*_root setting -- like Modules 14, 15, and 17, this engine
+    # never writes any file. It reads the completed ValidationRun and its
+    # audit trail (ValidationResult, RemediationChange, Issue, DataProfile)
+    # from the database and persists QualityControlRun + QualityFinding rows.
+    #
+    # Caps individual QualityFinding rows persisted per QualityControlRun.
+    # Same bounded-but-never-silent pattern as every prior *_MAX_PERSISTED_*
+    # setting: QualityControlRun.total_findings is always the true total from
+    # the engine even when this cap is reached; the persisted row count may be
+    # lower. Default 10,000 matches every prior bounded-findings setting in
+    # this project.
+    quality_max_persisted_findings: int = Field(
+        default=10_000, alias="QUALITY_MAX_PERSISTED_FINDINGS", gt=0
+    )
+
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"

@@ -13,6 +13,26 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///./test.db")
 os.environ.setdefault("APP_ENV", "development")
 os.environ.setdefault("LOG_FORMAT", "console")
 
+# ---------------------------------------------------------------------------
+# Bcrypt speed-up for the test suite.
+#
+# bcrypt's default work factor (rounds=12) costs ~0.8 s per hash. With
+# ~50+ registrations spread across the test files, the cumulative cost
+# pushes the total run time well over a minute. Dropping to rounds=4
+# makes each hash ~250x faster (~3 ms) with no impact on security in the
+# test environment. Production code always uses the default gensalt().
+# ---------------------------------------------------------------------------
+import bcrypt as _bcrypt
+
+_original_gensalt = _bcrypt.gensalt
+
+
+def _fast_gensalt(rounds: int = 4, prefix: bytes = b"2b") -> bytes:  # noqa: B008
+    return _original_gensalt(rounds=rounds, prefix=prefix)
+
+
+_bcrypt.gensalt = _fast_gensalt  # type: ignore[assignment]
+
 import pytest
 from fastapi.testclient import TestClient
 

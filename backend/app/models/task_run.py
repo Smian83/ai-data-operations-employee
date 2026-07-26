@@ -181,6 +181,29 @@ class TaskRun(Base):
     issue_detection_run: Mapped["IssueDetectionRun | None"] = relationship(  # noqa: F821
         back_populates="task_run", uselist=False
     )
+    # Module 15: at most one immutable remediation summary per run
+    # (enforced by uq_remediation_runs_task_run_id at the database layer).
+    # Same read-only-snapshot shape as issue_detection_run/data_profile.
+    # Explicit foreign_keys required -- RemediationRun has two FKs back into
+    # task_runs (task_run_id AND source_task_run_id), so this side of the
+    # relationship needs the same disambiguation as RemediationRun.task_run
+    # itself (see that model's own comment).
+    remediation_run: Mapped["RemediationRun | None"] = relationship(  # noqa: F821
+        back_populates="task_run",
+        uselist=False,
+        foreign_keys="[RemediationRun.organization_id, RemediationRun.task_run_id]",
+    )
+    # Module 17: at most one immutable validation summary per run (enforced
+    # by uq_validation_runs_task_run_id at the database layer). Same
+    # read-only-snapshot shape as issue_detection_run/remediation_run.
+    # Explicit foreign_keys required -- ValidationRun has only one FK into
+    # task_runs (task_run_id), but we specify it explicitly anyway for
+    # consistency with the remediation_run disambiguation pattern above.
+    validation_run: Mapped["ValidationRun | None"] = relationship(  # noqa: F821
+        back_populates="task_run",
+        uselist=False,
+        foreign_keys="[ValidationRun.organization_id, ValidationRun.task_run_id]",
+    )
 
     def __repr__(self) -> str:
         return f"TaskRun(id={self.id!r}, task={self.task_id!r}, status={self.status!r})"

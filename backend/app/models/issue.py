@@ -22,6 +22,15 @@ only its immediate parent run, nothing denormalized beyond that" pattern
 CleaningChange/StandardizationChange/MatchDecision/ExportRowExclusion/
 ArtifactRetentionEvent all already use -- see app.schemas.issue_detection
 (added in a later Module 14 phase).
+
+Module 15 addition: UniqueConstraint(organization_id, id). Added
+additively -- this table did not need to be a composite-FK *target* until
+now. Module 15's RemediationChange.source_issue_id is a required composite
+FK (organization_id, source_issue_id) -> issues(organization_id, id), and
+this project's own established rule (learned in Module 6: add the
+constraint at the same time a table is created, not after the first
+FK-target failure surfaces on SQLite) requires it. Purely additive: does
+not change any existing query, constraint, or row.
 """
 import uuid
 from datetime import datetime
@@ -35,6 +44,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     func,
 )
@@ -53,6 +63,11 @@ class Issue(Base):
             name="fk_issues_org_detection_run",
             ondelete="CASCADE",
         ),
+        # Module 15: required so RemediationChange can have a composite FK
+        # (organization_id, source_issue_id) -> (organization_id, id), same
+        # pattern as every other parent-of-child-audit-rows table in this
+        # project.
+        UniqueConstraint("organization_id", "id", name="uq_issues_org_id"),
         CheckConstraint(
             "issue_type IN (" + ", ".join(f"'{t}'" for t in ISSUE_TYPES) + ")",
             name="ck_issues_issue_type_valid",
@@ -93,6 +108,14 @@ class Issue(Base):
     )
 
     detection_run: Mapped["IssueDetectionRun"] = relationship(back_populates="issues")
+    # Module 15: normally empty/one-element -- an Issue is remediated at
+    # most once per RemediationRun, and typically only ever considered by
+    # one. A list (not uselist=False) since nothing prevents multiple
+    # independent RemediationRuns from each considering the same Issue
+    # (see docs/module-15-deterministic-cleaning-engine-design.md Risk R5).
+    remediation_changes: Mapped[list["RemediationChange"]] = relationship(  # noqa: F821
+        back_populates="source_issue"
+    )
 
     def __repr__(self) -> str:
         return (

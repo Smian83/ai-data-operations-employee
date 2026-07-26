@@ -37,7 +37,17 @@ from app.models.cleaning_change import CleaningChange
 from app.models.cleaning_run import CleaningRun
 from app.models.data_profile import DataProfile
 from app.models.data_source import DataSource
-from app.models.enums import ISSUE_SEVERITIES, ISSUE_TYPES, TaskType
+from app.models.enums import (
+    ISSUE_SEVERITIES,
+    ISSUE_TYPES,
+    QUALITY_CATEGORIES,
+    QUALITY_FINDING_OUTCOMES,
+    QUALITY_FINDING_SEVERITIES,
+    REMEDIATION_ACTIONS,
+    VALIDATION_OUTCOMES,
+    VALIDATION_RULE_NAMES,
+    TaskType,
+)
 from app.models.export_row_exclusion import ExportRowExclusion
 from app.models.export_run import ExportRun
 from app.models.issue import Issue
@@ -48,6 +58,13 @@ from app.models.match_rule_field import MatchRuleField
 from app.models.match_rule_set import MatchRuleSet
 from app.models.match_run import MatchRun
 from app.models.match_skipped_block import MatchSkippedBlock
+from app.models.remediation_change import RemediationChange
+from app.models.remediation_change_decision import RemediationChangeDecision
+from app.models.remediation_run import RemediationRun
+from app.models.quality_control_run import QualityControlRun
+from app.models.quality_finding import QualityFinding
+from app.models.validation_result import ValidationResult
+from app.models.validation_run import ValidationRun
 from app.models.standardization_change import StandardizationChange
 from app.models.standardization_column_mapping import StandardizationColumnMapping
 from app.models.standardization_lookup_entry import StandardizationLookupEntry
@@ -68,6 +85,15 @@ from app.schemas.match_decision import MatchDecisionRead
 from app.schemas.match_group import MatchGroupRead
 from app.schemas.match_rule_set import MatchRuleSetCreate, MatchRuleSetRead
 from app.schemas.match_run import MatchRunRead
+from app.schemas.remediation import (
+    BulkDecisionResponse,
+    RemediationChangeDecisionRead,
+    RemediationChangeDecisionRequest,
+    RemediationChangeRead,
+    RemediationRunRead,
+)
+from app.schemas.quality_control import QualityControlRunRead, QualityFindingRead
+from app.schemas.validation import ValidationResultRead, ValidationRunRead
 from app.schemas.match_skipped_block import MatchSkippedBlockRead
 from app.schemas.pagination import PaginatedResponse
 from app.schemas.standardization_change import StandardizationChangeRead
@@ -330,28 +356,36 @@ def create_task_run(
     prior SYNC run's DataProfile to clean), for STANDARDIZE tasks (which
     prior TRANSFORM run's approved CleaningRun to standardize), for MATCH
     tasks (which prior STANDARDIZE run's approved StandardizationRun to
-    match/deduplicate), and, as of Module 9, for EXPORT tasks too (which
-    prior MATCH run's approved MatchRun to materialize) -- same
-    required/rejected branch extended to a fourth task_type, still
-    rejected for every other task type, so the field's meaning can never
-    be ambiguous per task. This API-layer check only confirms the
-    referenced run exists in the same org; the deeper "must be an
-    approved MatchRun" check for EXPORT stays in ExportHandler, exactly
-    as MATCH's StandardizationRun check stays in MatchHandler."""
+    match/deduplicate), as of Module 9, for EXPORT tasks too (which prior
+    MATCH run's approved MatchRun to materialize), and, as of Module 15
+    Phase 3, for REMEDIATE tasks too (which prior DETECT run's Issues to
+    propose corrections for), and, as of Module 17 Phase 3, for VALIDATE
+    tasks too (which prior REMEDIATE run's approved changes to validate) --
+    same required/rejected branch extended to a sixth task_type, still
+    rejected for every other task type, so the field's meaning can never be
+    ambiguous per task. This API-layer check only confirms the referenced
+    run exists in the same org; the deeper checks stay in each handler.
+    Note: unlike TRANSFORM/STANDARDIZE/MATCH/EXPORT, REMEDIATE's upstream
+    run (IssueDetectionRun) has no status/approval gate at all -- see
+    RemediationRun's own docstring -- so no equivalent "must be approved"
+    check exists anywhere for REMEDIATE. VALIDATE similarly has no
+    API-level approval gate (the approval lives on RemediationChangeDecision
+    rows, not on RemediationRun itself)."""
     # Inactive or cross-org task -> 404, same as any other direct access.
     task = _get_active_task_or_404(db, task_id, current_user.organization_id)
 
     source_task_run_id = payload.source_task_run_id if payload is not None else None
 
     if task.task_type in (
-        TaskType.TRANSFORM, TaskType.STANDARDIZE, TaskType.MATCH, TaskType.EXPORT
+        TaskType.TRANSFORM, TaskType.STANDARDIZE, TaskType.MATCH, TaskType.EXPORT,
+        TaskType.REMEDIATE, TaskType.VALIDATE,
     ):
         if source_task_run_id is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "source_task_run_id is required for TRANSFORM, STANDARDIZE, "
-                    "MATCH, and EXPORT tasks"
+                    "MATCH, EXPORT, REMEDIATE, and VALIDATE tasks"
                 ),
             )
         source_run_exists = db.execute(
@@ -370,7 +404,7 @@ def create_task_run(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 "source_task_run_id is only valid for TRANSFORM, STANDARDIZE, "
-                "MATCH, and EXPORT tasks"
+                "MATCH, EXPORT, REMEDIATE, and VALIDATE tasks"
             ),
         )
 
@@ -2044,6 +2078,1083 @@ def list_task_run_detection_issues(
             original_value=row.original_value,
             suggested_fix=row.suggested_fix,
             confidence=row.confidence,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+    return PaginatedResponse(
+        items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+# --- Module 15 Phase 4: Remediation API -------------------------------------
+#
+# Read-only orchestration only, same discipline as the Module 14 Phase 3
+# section above: this router never imports or calls anything from
+# app.remediation (the pure engine) or app.worker.handlers.remediation.
+# Both endpoints below only look up rows the worker already wrote (see
+# RemediationHandler) and shape them into response DTOs -- all remediation
+# business logic already ran inside the worker, synchronously, before
+# either endpoint is ever called. No write operations, no approval/apply
+# endpoints, no source data ever read or touched here.
+#
+# Neither endpoint returns a SQLAlchemy model: the summary endpoint
+# returns RemediationRunRead, built explicitly field by field (including
+# the two joined-in/derived fields dataset_sha256 and
+# processing_duration_ms -- see app.schemas.remediation's own docstring
+# for why those are computed here rather than duplicated as columns); the
+# detail endpoint builds each RemediationChangeRead explicitly, exactly
+# like IssueRead already does for Module 14.
+
+
+def _get_remediation_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> tuple[RemediationRun, TaskRun]:
+    """Shared 404 chain for every remediation-result endpoint: task
+    visible -> run visible -> remediation result exists. Direct mirror of
+    _get_issue_detection_run_or_404, except it also returns the TaskRun
+    row itself (not just confirms its existence) -- the summary endpoint
+    needs TaskRun.started_at/finished_at to compute processing_duration_ms
+    without a second query."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    task_run = db.execute(
+        select(TaskRun).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if task_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    remediation_run = db.execute(
+        select(RemediationRun).where(
+            RemediationRun.task_run_id == run_id,
+            RemediationRun.task_id == task.id,
+            RemediationRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if remediation_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Remediation result not found"
+        )
+    return remediation_run, task_run
+
+
+@router.get("/{task_id}/runs/{run_id}/remediation", response_model=RemediationRunRead)
+def get_task_run_remediation(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> RemediationRunRead:
+    """Module 15: the summary result of a REMEDIATE TaskRun -- aggregate
+    counts, the changes_by_action/changes_by_column/skipped_by_reason
+    breakdowns, engine version, the dataset hash the run was verified
+    against, and processing duration. Cheap: every count either was
+    already computed by RemediationHandler (changes_by_action,
+    skipped_by_reason, the three top-level counts) or is a single
+    GROUP BY / one joined row computed here (changes_by_column,
+    dataset_sha256, processing_duration_ms) -- no RemediationChange row is
+    ever loaded in full, and the pure engine is never re-run. 404 if the
+    run isn't visible to this org or no remediation result exists yet."""
+    remediation_run, task_run = _get_remediation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    # The upstream IssueDetectionRun this remediation was verified
+    # against -- always present in practice (RESTRICT FK,
+    # RemediationHandler never persists without it), looked up defensively
+    # rather than assumed.
+    detection_run = db.execute(
+        select(IssueDetectionRun).where(
+            IssueDetectionRun.task_run_id == remediation_run.source_task_run_id,
+            IssueDetectionRun.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+
+    processing_duration_ms = None
+    if task_run.started_at is not None and task_run.finished_at is not None:
+        processing_duration_ms = round(
+            (task_run.finished_at - task_run.started_at).total_seconds() * 1000
+        )
+
+    column_counts = db.execute(
+        select(RemediationChange.column_name, func.count())
+        .where(
+            RemediationChange.remediation_run_id == remediation_run.id,
+            RemediationChange.column_name.is_not(None),
+        )
+        .group_by(RemediationChange.column_name)
+    ).all()
+
+    # Module 16 Phase 3: decision breakdown (single GROUP BY query, no N+1).
+    # The 409 enforcement on approve/reject guarantees ≤1 decision row per
+    # change, so GROUP BY on the decisions table gives exact per-outcome
+    # counts. pending = total_changes - approved - rejected.
+    decision_count_rows = db.execute(
+        select(RemediationChangeDecision.decision, func.count().label("cnt"))
+        .where(
+            RemediationChangeDecision.remediation_run_id == remediation_run.id,
+            RemediationChangeDecision.organization_id == current_user.organization_id,
+        )
+        .group_by(RemediationChangeDecision.decision)
+    ).all()
+    decided: dict[str, int] = {d: c for d, c in decision_count_rows}
+    approved_count = decided.get("approved", 0)
+    rejected_count = decided.get("rejected", 0)
+    decision_summary = {
+        "pending": max(0, remediation_run.total_changes_count - approved_count - rejected_count),
+        "approved": approved_count,
+        "rejected": rejected_count,
+    }
+
+    return RemediationRunRead(
+        id=remediation_run.id,
+        organization_id=remediation_run.organization_id,
+        task_run_id=remediation_run.task_run_id,
+        task_id=remediation_run.task_id,
+        data_source_id=remediation_run.data_source_id,
+        source_task_run_id=remediation_run.source_task_run_id,
+        issues_considered_count=remediation_run.issues_considered_count,
+        total_changes_count=remediation_run.total_changes_count,
+        issues_skipped_count=remediation_run.issues_skipped_count,
+        changes_by_action=remediation_run.changes_by_action,
+        changes_by_column={name: count for name, count in column_counts},
+        skipped_by_reason=remediation_run.skipped_by_reason,
+        remediation_engine_version=remediation_run.remediation_engine_version,
+        dataset_sha256=detection_run.source_sha256 if detection_run is not None else None,
+        processing_duration_ms=processing_duration_ms,
+        decision_summary=decision_summary,
+        created_at=remediation_run.created_at,
+    )
+
+
+# Query-param name -> RemediationChange column, same single-source-of-truth
+# mapping convention _ISSUE_FILTER_COLUMNS established for Module 14.
+# skip_reason is deliberately NOT filterable here -- a RemediationChange
+# row is, by construction, always a proposed change (RuleOutcome.changed
+# was True); no change row ever carries a skip reason, so a skip_reason
+# filter on this endpoint could never match anything. The skip-reason
+# breakdown lives on the summary endpoint instead
+# (RemediationRunRead.skipped_by_reason), which is the only place a
+# reason-per-skip count is persisted at all (see that field's own
+# docstring on RemediationRun).
+_REMEDIATION_CHANGE_FILTER_COLUMNS = {
+    "action": RemediationChange.action,
+    "column_name": RemediationChange.column_name,
+    "row_number": RemediationChange.row_number,
+}
+
+
+def _apply_remediation_change_filters(filters: list, **filter_values) -> list:
+    for name, value in filter_values.items():
+        if value is not None:
+            filters.append(_REMEDIATION_CHANGE_FILTER_COLUMNS[name] == value)
+    return filters
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/remediation/changes",
+    response_model=PaginatedResponse[RemediationChangeRead],
+)
+def list_task_run_remediation_changes(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    action: str | None = Query(default=None),
+    column_name: str | None = Query(default=None),
+    row_number: int | None = Query(default=None, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[RemediationChangeRead]:
+    """Module 15: the bounded per-proposal list for a remediation run, in
+    stable (row_number, id) order regardless of insertion order -- same
+    server-side limit/offset pagination shape as list_task_run_detection_
+    issues. Filterable by action, column_name, and row_number,
+    individually or combined -- see _REMEDIATION_CHANGE_FILTER_COLUMNS.
+    total_changes_count on the parent RemediationRun (surfaced via GET
+    .../remediation) is always accurate even when a filter narrows what
+    this endpoint returns, since that count reflects every persisted
+    change, not the current filtered page."""
+    remediation_run, _ = _get_remediation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    if action is not None and action not in REMEDIATION_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"action must be one of {REMEDIATION_ACTIONS}",
+        )
+
+    filters = [
+        RemediationChange.remediation_run_id == remediation_run.id,
+        RemediationChange.organization_id == current_user.organization_id,
+    ]
+    _apply_remediation_change_filters(
+        filters, action=action, column_name=column_name, row_number=row_number
+    )
+
+    total = db.execute(
+        select(func.count()).select_from(RemediationChange).where(*filters)
+    ).scalar_one()
+    rows = db.execute(
+        select(RemediationChange)
+        .where(*filters)
+        .order_by(RemediationChange.row_number, RemediationChange.id)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    # Module 16 Phase 3: batch-load effective decisions for this page (no N+1).
+    page_change_ids = [row.id for row in rows]
+    decision_status_map = _get_decision_status_map(
+        db, page_change_ids, current_user.organization_id
+    )
+
+    items = [
+        RemediationChangeRead(
+            id=row.id,
+            remediation_run_id=row.remediation_run_id,
+            source_issue_id=row.source_issue_id,
+            row_number=row.row_number,
+            column_name=row.column_name,
+            action=row.action,
+            original_value=row.original_value,
+            proposed_value=row.proposed_value,
+            reason=row.reason,
+            confidence=row.confidence,
+            created_at=row.created_at,
+            decision_status=decision_status_map.get(row.id, "pending"),
+        )
+        for row in rows
+    ]
+
+    return PaginatedResponse(
+        items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+# ---------------------------------------------------------------------------
+# Module 16: Approval Queue -- helpers, bulk ops, per-change endpoints
+# ---------------------------------------------------------------------------
+
+
+def _get_decision_status_map(
+    db: Session,
+    change_ids: list[uuid.UUID],
+    organization_id: uuid.UUID,
+) -> dict[uuid.UUID, str]:
+    """Batch-load the effective decision status for a list of change IDs.
+
+    Returns a dict mapping change_id → 'approved' | 'rejected'. Change IDs
+    absent from the dict have no decision yet (status = 'pending').
+
+    Loads all relevant rows ordered by decision_timestamp DESC, then picks
+    the first occurrence of each change_id in Python. This gives the latest
+    effective decision without DISTINCT ON (which is PostgreSQL-only). The
+    entire batch is resolved in a single SQL query regardless of page size."""
+    if not change_ids:
+        return {}
+    rows = db.execute(
+        select(
+            RemediationChangeDecision.remediation_change_id,
+            RemediationChangeDecision.decision,
+        )
+        .where(
+            RemediationChangeDecision.remediation_change_id.in_(change_ids),
+            RemediationChangeDecision.organization_id == organization_id,
+        )
+        .order_by(RemediationChangeDecision.decision_timestamp.desc())
+    ).all()
+    status_map: dict[uuid.UUID, str] = {}
+    for change_id, decision in rows:
+        if change_id not in status_map:  # first = latest (DESC)
+            status_map[change_id] = decision
+    return status_map
+
+
+def _bulk_decide(
+    db: Session,
+    remediation_run,
+    decision_value: str,
+    current_user: "User",
+    body: "RemediationChangeDecisionRequest | None",
+) -> "BulkDecisionResponse":
+    """Shared logic for approve-all and reject-all.
+
+    Algorithm (no N+1):
+    1. Load all change IDs for this run in stable (row_number, id) order.
+    2. Load all change IDs that already have any decision (single IN query).
+    3. Insert RemediationChangeDecision rows for the pending set only,
+       using db.add_all() for a single round-trip.
+    4. Return counts.
+
+    Immutability: existing decisions are never touched. This function only
+    inserts; it never UPDATE or DELETE anything in remediation_change_decisions.
+    Idempotent: calling twice with no intervening changes results in 0 new
+    rows on the second call (all changes already have decisions).
+    """
+    org_id = remediation_run.organization_id
+
+    # Step 1: all change IDs for this run, stable order
+    all_change_ids: list[uuid.UUID] = db.execute(
+        select(RemediationChange.id)
+        .where(
+            RemediationChange.remediation_run_id == remediation_run.id,
+            RemediationChange.organization_id == org_id,
+        )
+        .order_by(RemediationChange.row_number, RemediationChange.id)
+    ).scalars().all()
+
+    total = len(all_change_ids)
+    if total == 0:
+        return BulkDecisionResponse(
+            total_changes=0,
+            approved_count=0,
+            rejected_count=0,
+            skipped_existing_count=0,
+        )
+
+    # Step 2: which change IDs already have at least one decision?
+    already_decided_ids: set[uuid.UUID] = set(
+        db.execute(
+            select(RemediationChangeDecision.remediation_change_id)
+            .where(
+                RemediationChangeDecision.remediation_change_id.in_(all_change_ids),
+                RemediationChangeDecision.organization_id == org_id,
+            )
+            .distinct()
+        ).scalars().all()
+    )
+
+    pending_ids = [c for c in all_change_ids if c not in already_decided_ids]
+    skipped = len(already_decided_ids)
+    new_count = len(pending_ids)
+
+    if pending_ids:
+        now = datetime.now(timezone.utc)
+        reviewer_name = current_user.full_name or current_user.email
+        comment = body.comment if body else None
+
+        # Step 3: bulk insert (single db.add_all, one INSERT per row but
+        # flushed together -- avoids per-row network round-trips)
+        db.add_all([
+            RemediationChangeDecision(
+                organization_id=org_id,
+                remediation_run_id=remediation_run.id,
+                remediation_change_id=change_id,
+                decision=decision_value,
+                reviewer_id=current_user.id,
+                reviewer_name=reviewer_name,
+                reviewer_role="superuser",
+                decision_timestamp=now,
+                comment=comment,
+            )
+            for change_id in pending_ids
+        ])
+        db.commit()
+
+    approved_count = new_count if decision_value == "approved" else 0
+    rejected_count = new_count if decision_value == "rejected" else 0
+    return BulkDecisionResponse(
+        total_changes=total,
+        approved_count=approved_count,
+        rejected_count=rejected_count,
+        skipped_existing_count=skipped,
+    )
+
+
+@router.post(
+    "/{task_id}/runs/{run_id}/remediation/approve-all",
+    response_model=BulkDecisionResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["tasks"],
+)
+def approve_all_remediation_changes(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    body: RemediationChangeDecisionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> BulkDecisionResponse:
+    """Module 16 Phase 3: bulk-approve all pending changes in a remediation run.
+
+    Only changes that have no existing decision are approved. Already-decided
+    changes (approved or rejected) are skipped and counted in
+    skipped_existing_count. No existing decision is ever modified or
+    overwritten -- this endpoint is purely additive.
+
+    Authentication: superuser only (same as per-change /approve).
+    Tenant isolation: four-layer 404 chain via _get_remediation_run_or_404.
+    Idempotent: calling twice is safe -- the second call returns
+        approved_count=0, skipped_existing_count=total_changes.
+    Performance: two SELECT queries + one bulk INSERT (db.add_all).
+    """
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers may approve remediation changes",
+        )
+    remediation_run, _ = _get_remediation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+    return _bulk_decide(db, remediation_run, "approved", current_user, body)
+
+
+@router.post(
+    "/{task_id}/runs/{run_id}/remediation/reject-all",
+    response_model=BulkDecisionResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["tasks"],
+)
+def reject_all_remediation_changes(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    body: RemediationChangeDecisionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> BulkDecisionResponse:
+    """Module 16 Phase 3: bulk-reject all pending changes in a remediation run.
+
+    Identical semantics and security model as approve_all_remediation_changes
+    above -- see that endpoint's docstring. The only difference is
+    decision_value='rejected'."""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers may reject remediation changes",
+        )
+    remediation_run, _ = _get_remediation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+    return _bulk_decide(db, remediation_run, "rejected", current_user, body)
+
+
+def _get_remediation_change_or_404(
+    db: Session,
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    change_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> tuple[RemediationChange, RemediationRun]:
+    """Four-layer 404 chain: task → task_run → remediation_run → change.
+    Every level is scoped to organization_id so no cross-tenant data leaks
+    through URL parameter manipulation. Returns (change, remediation_run).
+
+    Uses the existing _get_remediation_run_or_404 for the first three
+    layers -- if task_id, run_id, or organization_id don't match, that
+    helper already raises 404 before we ever query remediation_changes.
+    The fourth layer adds the change_id check inside the same org + run
+    scope, consistent with how CleaningChange and RemediationChange list
+    endpoints already scope sub-resource queries."""
+    remediation_run, _ = _get_remediation_run_or_404(db, task_id, run_id, organization_id)
+    change = db.execute(
+        select(RemediationChange).where(
+            RemediationChange.id == change_id,
+            RemediationChange.remediation_run_id == remediation_run.id,
+            RemediationChange.organization_id == organization_id,
+        )
+    ).scalar_one_or_none()
+    if change is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Remediation change not found",
+        )
+    return change, remediation_run
+
+
+def _get_existing_decision(
+    db: Session,
+    change_id: uuid.UUID,
+    organization_id: uuid.UUID,
+) -> RemediationChangeDecision | None:
+    """Return the latest decision for a change (by decision_timestamp DESC),
+    or None if no decision has been recorded yet.  Used by both the GET
+    endpoint (to return the current decision) and the POST endpoints (to
+    enforce the Module 16 one-decision-per-change rule)."""
+    return db.execute(
+        select(RemediationChangeDecision)
+        .where(
+            RemediationChangeDecision.remediation_change_id == change_id,
+            RemediationChangeDecision.organization_id == organization_id,
+        )
+        .order_by(RemediationChangeDecision.decision_timestamp.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/remediation/changes/{change_id}/decision",
+    response_model=RemediationChangeDecisionRead,
+    tags=["tasks"],
+)
+def get_remediation_change_decision(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    change_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> RemediationChangeDecision:
+    """Module 16: return the current (latest by decision_timestamp) decision
+    for a specific remediation change, or 404 if no decision exists yet.
+
+    Authentication: any authenticated user in the owning organization.
+    Authorization: read access to decisions is not gated on is_superuser --
+    visibility of the approval outcome is organization-wide, same as how
+    CleaningRun.status is readable by any org member regardless of who set
+    it. Only *writing* (approve/reject) is superuser-restricted.
+
+    Tenant isolation: the four-layer 404 chain in
+    _get_remediation_change_or_404 ensures the change (and by extension
+    the decision) belongs to current_user.organization_id before any data
+    is returned. A change that exists but belongs to a different org is
+    indistinguishable from one that doesn't exist."""
+    change, _ = _get_remediation_change_or_404(
+        db, task_id, run_id, change_id, current_user.organization_id
+    )
+    decision = _get_existing_decision(db, change.id, current_user.organization_id)
+    if decision is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No decision has been recorded for this remediation change yet",
+        )
+    return decision
+
+
+def _create_decision(
+    db: Session,
+    change: RemediationChange,
+    decision_value: str,
+    current_user: User,
+    body: RemediationChangeDecisionRequest | None,
+) -> RemediationChangeDecision:
+    """Shared insert logic for the approve and reject endpoints.
+
+    Security invariants enforced here (not in the caller):
+    - reviewer_id / reviewer_name / reviewer_role / decision_timestamp are
+      ALL set from server-side data (the authenticated user + utcnow).
+      The caller's request body supplies only an optional comment -- there
+      is no way to spoof reviewer identity or backdate a decision through
+      the API.
+    - Only superusers reach this function; the caller checks is_superuser
+      and raises 403 before calling.
+    - The 409 one-decision-per-change check is also done by the caller
+      before reaching this function.
+
+    reviewer_name snapshot: full_name if set, else email. Captures the
+    display name at decision time so the audit trail survives a future
+    name change or user deletion (reviewer_id goes NULL on delete, but
+    reviewer_name / reviewer_role are immutable once written).
+
+    reviewer_role snapshot: "superuser" for any user who reaches this
+    function (enforced above). Stored as a string so a future role system
+    can extend the vocabulary without a migration."""
+    reviewer_name = current_user.full_name or current_user.email
+    reviewer_role = "superuser"  # only superusers may create decisions in M16
+
+    decision = RemediationChangeDecision(
+        organization_id=change.organization_id,
+        remediation_run_id=change.remediation_run_id,
+        remediation_change_id=change.id,
+        decision=decision_value,
+        reviewer_id=current_user.id,
+        reviewer_name=reviewer_name,
+        reviewer_role=reviewer_role,
+        decision_timestamp=datetime.now(timezone.utc),
+        comment=body.comment if body else None,
+        # applied_at / applied_by always NULL in Module 16
+    )
+    db.add(decision)
+    db.commit()
+    db.refresh(decision)
+    return decision
+
+
+@router.post(
+    "/{task_id}/runs/{run_id}/remediation/changes/{change_id}/approve",
+    response_model=RemediationChangeDecisionRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["tasks"],
+)
+def approve_remediation_change(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    change_id: uuid.UUID,
+    body: RemediationChangeDecisionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> RemediationChangeDecision:
+    """Module 16: record an 'approved' decision for a specific remediation
+    change proposal.  Returns the newly created decision row (HTTP 201).
+
+    Authentication: authenticated user required (get_current_active_user).
+    Authorization: superuser only -- regular org members may view change
+      proposals (Module 15 endpoints) and decisions (GET /decision) but
+      may not approve or reject them.
+    Tenant isolation: four-layer 404 chain scopes every query to
+      current_user.organization_id before any write occurs.
+
+    409 Conflict: if any decision already exists for this change, the
+      endpoint returns 409 and does NOT insert a new row.  Module 16 is
+      an approval queue, not an override system.  Admin override is
+      intentionally deferred to a future dedicated Override module where
+      append-only history and explicit override reasons will be
+      implemented safely (see design doc Section 2a).
+
+    Request body: optional JSON object with a single optional field
+      { "comment": "..." }. Omitting the body entirely is valid.
+    Response: the immutable RemediationChangeDecision row as inserted --
+      reviewer_id / reviewer_name / reviewer_role / decision_timestamp
+      are always sourced from the server, never from the request body."""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers may approve remediation changes",
+        )
+    change, _ = _get_remediation_change_or_404(
+        db, task_id, run_id, change_id, current_user.organization_id
+    )
+    existing = _get_existing_decision(db, change.id, current_user.organization_id)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A decision already exists for this remediation change "
+                f"(decision: '{existing.decision}', "
+                f"recorded at: {existing.decision_timestamp.isoformat()})"
+            ),
+        )
+    return _create_decision(db, change, "approved", current_user, body)
+
+
+@router.post(
+    "/{task_id}/runs/{run_id}/remediation/changes/{change_id}/reject",
+    response_model=RemediationChangeDecisionRead,
+    status_code=status.HTTP_201_CREATED,
+    tags=["tasks"],
+)
+def reject_remediation_change(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    change_id: uuid.UUID,
+    body: RemediationChangeDecisionRequest | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> RemediationChangeDecision:
+    """Module 16: record a 'rejected' decision for a specific remediation
+    change proposal.  Returns the newly created decision row (HTTP 201).
+
+    Identical security model and 409 semantics as approve_remediation_change
+    above -- see that endpoint's docstring for the full rationale.  The only
+    difference is decision_value='rejected'."""
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only superusers may reject remediation changes",
+        )
+    change, _ = _get_remediation_change_or_404(
+        db, task_id, run_id, change_id, current_user.organization_id
+    )
+    existing = _get_existing_decision(db, change.id, current_user.organization_id)
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"A decision already exists for this remediation change "
+                f"(decision: '{existing.decision}', "
+                f"recorded at: {existing.decision_timestamp.isoformat()})"
+            ),
+        )
+    return _create_decision(db, change, "rejected", current_user, body)
+
+
+# ---------------------------------------------------------------------------
+# Module 17 Phase 4: Validation API -- read-only
+# ---------------------------------------------------------------------------
+
+
+def _get_validation_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> tuple[ValidationRun, TaskRun]:
+    """Shared 404 chain for every validation-result endpoint: task visible
+    -> run visible -> validation result exists. Direct mirror of
+    _get_remediation_run_or_404: also returns the TaskRun row itself (not
+    just confirms its existence) so the summary endpoint can compute
+    processing_duration_ms from TaskRun.started_at/finished_at without a
+    second round-trip."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    task_run = db.execute(
+        select(TaskRun).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if task_run is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found")
+
+    validation_run = db.execute(
+        select(ValidationRun).where(
+            ValidationRun.task_run_id == run_id,
+            ValidationRun.task_id == task.id,
+            ValidationRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if validation_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Validation result not found"
+        )
+    return validation_run, task_run
+
+
+@router.get("/{task_id}/runs/{run_id}/validation", response_model=ValidationRunRead)
+def get_task_run_validation(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ValidationRunRead:
+    """Module 17 Phase 4: the summary result of a VALIDATE TaskRun --
+    aggregate counts, results_by_rule breakdown, engine version, and
+    processing duration. Cheap: every count was already computed by
+    ValidationHandler at persist time (approved_changes_considered,
+    passed_count, failed_count, skipped_count, results_by_rule) --
+    no ValidationResult row is ever loaded in full and the pure engine is
+    never re-run. processing_duration_ms is derived from TaskRun.started_at
+    / TaskRun.finished_at (both always present on a completed run).
+
+    Authentication: any authenticated active org member (no superuser gate
+    -- read-only access to validation outcomes is organization-wide, same
+    pattern as every other read-only result summary endpoint).
+    Tenant isolation: three-layer 404 chain (task -> task_run ->
+    validation_run), all queries scoped to current_user.organization_id."""
+    validation_run, task_run = _get_validation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    processing_duration_ms = None
+    if task_run.started_at is not None and task_run.finished_at is not None:
+        processing_duration_ms = round(
+            (task_run.finished_at - task_run.started_at).total_seconds() * 1000
+        )
+
+    return ValidationRunRead(
+        id=validation_run.id,
+        organization_id=validation_run.organization_id,
+        task_run_id=validation_run.task_run_id,
+        task_id=validation_run.task_id,
+        data_source_id=validation_run.data_source_id,
+        remediation_run_id=validation_run.remediation_run_id,
+        approved_changes_considered=validation_run.approved_changes_considered,
+        passed_count=validation_run.passed_count,
+        failed_count=validation_run.failed_count,
+        skipped_count=validation_run.skipped_count,
+        results_by_rule=validation_run.results_by_rule,
+        validation_engine_version=validation_run.validation_engine_version,
+        processing_duration_ms=processing_duration_ms,
+        created_at=validation_run.created_at,
+    )
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/validation/results",
+    response_model=PaginatedResponse[ValidationResultRead],
+)
+def list_task_run_validation_results(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    outcome: str | None = Query(default=None),
+    validation_rule: str | None = Query(default=None),
+    column_name: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[ValidationResultRead]:
+    """Module 17 Phase 4: paginated per-result list for a validation run,
+    in stable (created_at ASC, id ASC) order. Filterable by outcome,
+    validation_rule, and column_name (exact match), individually or
+    combined.
+
+    outcome must be one of VALIDATION_OUTCOMES ('passed', 'failed',
+    'skipped'); an unrecognised value is rejected with 422.
+    validation_rule must be one of VALIDATION_RULE_NAMES; an unrecognised
+    value is rejected with 422.
+    column_name is an exact-match filter against RemediationChange.column_name
+    using a single explicit JOIN -- only introduced when column_name is
+    provided, avoiding an unnecessary join on unfiltered requests. This
+    is the only query in this endpoint that touches RemediationChange.
+
+    Performance: one paginated data query + one COUNT query with identical
+    filters; no per-row sub-queries; no N+1 pattern.
+
+    Default limit: 50. Maximum limit: 100 (enforced by PaginationParams).
+    Authentication: any authenticated active org member.
+    Tenant isolation: all filters include ValidationResult.organization_id."""
+    validation_run, _ = _get_validation_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    if outcome is not None and outcome not in VALIDATION_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"outcome must be one of {VALIDATION_OUTCOMES}",
+        )
+    if validation_rule is not None and validation_rule not in VALIDATION_RULE_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"validation_rule must be one of {VALIDATION_RULE_NAMES}",
+        )
+
+    # Base filters -- always org-scoped and run-scoped.
+    filters: list = [
+        ValidationResult.validation_run_id == validation_run.id,
+        ValidationResult.organization_id == current_user.organization_id,
+    ]
+    if outcome is not None:
+        filters.append(ValidationResult.outcome == outcome)
+    if validation_rule is not None:
+        filters.append(ValidationResult.validation_rule == validation_rule)
+
+    # column_name lives on RemediationChange, not ValidationResult.
+    # Introduce the JOIN only when this filter is requested to keep the
+    # common unfiltered path join-free.
+    if column_name is not None:
+        base_stmt = (
+            select(ValidationResult)
+            .join(
+                RemediationChange,
+                ValidationResult.remediation_change_id == RemediationChange.id,
+            )
+            .where(*filters, RemediationChange.column_name == column_name)
+        )
+        count_stmt = (
+            select(func.count())
+            .select_from(ValidationResult)
+            .join(
+                RemediationChange,
+                ValidationResult.remediation_change_id == RemediationChange.id,
+            )
+            .where(*filters, RemediationChange.column_name == column_name)
+        )
+    else:
+        base_stmt = select(ValidationResult).where(*filters)
+        count_stmt = select(func.count()).select_from(ValidationResult).where(*filters)
+
+    total = db.execute(count_stmt).scalar_one()
+    rows = db.execute(
+        base_stmt
+        .order_by(ValidationResult.created_at, ValidationResult.id)
+        .limit(pagination.limit)
+        .offset(pagination.offset)
+    ).scalars().all()
+
+    items = [
+        ValidationResultRead(
+            id=row.id,
+            validation_run_id=row.validation_run_id,
+            remediation_run_id=row.remediation_run_id,
+            remediation_change_id=row.remediation_change_id,
+            source_issue_id=row.source_issue_id,
+            validation_rule=row.validation_rule,
+            validation_rule_version=row.validation_rule_version,
+            outcome=row.outcome,
+            reason=row.reason,
+            original_value=row.original_value,
+            proposed_value=row.proposed_value,
+            validation_engine_version=row.validation_engine_version,
+            created_at=row.created_at,
+        )
+        for row in rows
+    ]
+
+    return PaginatedResponse(
+        items=items, total=total, limit=pagination.limit, offset=pagination.offset
+    )
+
+
+# ── Module 18: Quality Control read-only endpoints ──────────────────────────
+
+
+def _get_quality_control_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> tuple[QualityControlRun, TaskRun]:
+    """Shared 404 chain: task visible → run visible → qc result exists.
+    Returns (QualityControlRun, TaskRun) so the summary endpoint can derive
+    processing_duration_ms without a second query."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    task_run = db.execute(
+        select(TaskRun).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if task_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found"
+        )
+
+    qc_run = db.execute(
+        select(QualityControlRun).where(
+            QualityControlRun.task_run_id == run_id,
+            QualityControlRun.task_id == task.id,
+            QualityControlRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if qc_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Quality control result not found",
+        )
+    return qc_run, task_run
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/quality-control",
+    response_model=QualityControlRunRead,
+)
+def get_task_run_quality_control(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> QualityControlRunRead:
+    """Module 18 Phase 3: quality control summary for a QUALITY_CTRL TaskRun.
+
+    Returns overall score, release recommendation, category breakdowns, and
+    processing duration. All counts and scores were pre-computed by
+    QualityControlHandler — no aggregation at query time.
+    processing_duration_ms is derived from TaskRun.started_at/finished_at.
+    Tenant isolation: three-layer 404 chain, all queries org-scoped."""
+    qc_run, task_run = _get_quality_control_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    processing_duration_ms: int | None = None
+    if task_run.started_at is not None and task_run.finished_at is not None:
+        processing_duration_ms = round(
+            (task_run.finished_at - task_run.started_at).total_seconds() * 1000
+        )
+
+    return QualityControlRunRead(
+        id=qc_run.id,
+        organization_id=qc_run.organization_id,
+        task_run_id=qc_run.task_run_id,
+        task_id=qc_run.task_id,
+        data_source_id=qc_run.data_source_id,
+        validation_run_id=qc_run.validation_run_id,
+        remediation_run_id=qc_run.remediation_run_id,
+        issue_detection_run_id=qc_run.issue_detection_run_id,
+        data_profile_id=qc_run.data_profile_id,
+        quality_engine_version=qc_run.quality_engine_version,
+        overall_score=qc_run.overall_score,
+        release_recommendation=qc_run.release_recommendation,
+        total_findings=qc_run.total_findings,
+        blocking_count=qc_run.blocking_count,
+        warning_count=qc_run.warning_count,
+        info_count=qc_run.info_count,
+        category_scores=qc_run.category_scores,
+        category_statuses=qc_run.category_statuses,
+        category_weights_used=qc_run.category_weights_used,
+        post_remediation_stats=qc_run.post_remediation_stats,
+        processing_duration_ms=processing_duration_ms,
+        created_at=qc_run.created_at,
+    )
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/quality-control/findings",
+    response_model=PaginatedResponse[QualityFindingRead],
+)
+def list_task_run_quality_control_findings(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    pagination: PaginationParams = Depends(),
+    category: str | None = Query(default=None),
+    severity: str | None = Query(default=None),
+    outcome: str | None = Query(default=None),
+    rule_name: str | None = Query(default=None),
+    affected_column: str | None = Query(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> PaginatedResponse[QualityFindingRead]:
+    """Module 18 Phase 3: paginated per-finding list for a quality control run.
+
+    Stable order: created_at ASC, id ASC. Filters (all exact-match, AND):
+    - category: validated against QUALITY_CATEGORIES; 422 if unknown
+    - severity: validated against QUALITY_FINDING_SEVERITIES; 422 if unknown
+    - outcome: validated against QUALITY_FINDING_OUTCOMES; 422 if unknown
+    - rule_name, affected_column: unknown value → empty result (not 422)
+
+    Default limit: 50, max 100. Tenant isolation: org-scoped on every query."""
+    qc_run, _ = _get_quality_control_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    if category is not None and category not in QUALITY_CATEGORIES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"category must be one of {sorted(QUALITY_CATEGORIES)}",
+        )
+    if severity is not None and severity not in QUALITY_FINDING_SEVERITIES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"severity must be one of {sorted(QUALITY_FINDING_SEVERITIES)}",
+        )
+    if outcome is not None and outcome not in QUALITY_FINDING_OUTCOMES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"outcome must be one of {sorted(QUALITY_FINDING_OUTCOMES)}",
+        )
+
+    filters: list = [
+        QualityFinding.quality_control_run_id == qc_run.id,
+        QualityFinding.organization_id == current_user.organization_id,
+    ]
+    if category is not None:
+        filters.append(QualityFinding.category == category)
+    if severity is not None:
+        filters.append(QualityFinding.severity == severity)
+    if outcome is not None:
+        filters.append(QualityFinding.outcome == outcome)
+    if rule_name is not None:
+        filters.append(QualityFinding.rule_name == rule_name)
+    if affected_column is not None:
+        filters.append(QualityFinding.affected_column == affected_column)
+
+    base_stmt = select(QualityFinding).where(*filters)
+    count_stmt = select(func.count()).select_from(QualityFinding).where(*filters)
+
+    total = db.execute(count_stmt).scalar_one()
+    rows = (
+        db.execute(
+            base_stmt
+            .order_by(QualityFinding.created_at, QualityFinding.id)
+            .limit(pagination.limit)
+            .offset(pagination.offset)
+        )
+        .scalars()
+        .all()
+    )
+
+    items = [
+        QualityFindingRead(
+            id=row.id,
+            quality_control_run_id=row.quality_control_run_id,
+            category=row.category,
+            rule_name=row.rule_name,
+            rule_version=row.rule_version,
+            severity=row.severity,
+            outcome=row.outcome,
+            reason=row.reason,
+            affected_row_count=row.affected_row_count,
+            affected_column=row.affected_column,
+            source_issue_id=row.source_issue_id,
+            remediation_change_id=row.remediation_change_id,
+            validation_result_id=row.validation_result_id,
+            quality_engine_version=row.quality_engine_version,
             created_at=row.created_at,
         )
         for row in rows

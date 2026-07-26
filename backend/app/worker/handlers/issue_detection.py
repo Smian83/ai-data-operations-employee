@@ -144,6 +144,11 @@ class IssueDetectionHandler:
                     ),
                 },
                 detection_engine_version=DETECTION_ENGINE_VERSION,
+                # Module 15 addition: already computed by load_csv, simply
+                # threaded through so app.worker.handlers.remediation can
+                # later verify it is remediating this exact dataset
+                # version. See IssueDetectionRun's own docstring.
+                source_sha256=loaded.source_sha256,
             )
             db.add(detection_run)
             for finding in result.findings:

@@ -20,6 +20,17 @@ app.worker.handlers.issue_detection), the same bounded-but-never-silent
 pattern CleaningRun.total_changes_count/CleaningChange already established
 in Module 6: the summary on this row is always accurate even when the
 detail rows beneath it are capped.
+
+Module 15 addition: source_sha256 (nullable). Added additively so Module
+15's RemediationHandler can verify it is remediating the exact same
+dataset version this run scanned -- app.profiling.csv_loader.load_csv
+already computes this hash for every file it loads (LoadedCsv.
+source_sha256; DataProfile has stored the equivalent since Module 5), it
+was simply never threaded through to this table before. Existing rows
+predate this column and are NULL; app.worker.handlers.remediation treats a
+NULL upstream hash as a permanent failure ("re-run detection before
+remediation"), never as a skipped or passed check. See
+docs/module-15-deterministic-cleaning-engine-design.md Section 2.
 """
 import uuid
 from datetime import datetime
@@ -115,6 +126,13 @@ class IssueDetectionRun(Base):
     detected_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+    # Module 15 addition (nullable): the source file's SHA-256 at the time
+    # this run scanned it, so app.worker.handlers.remediation can verify
+    # it is remediating the identical dataset version, not just the same
+    # data_source_id. NULL on every row created before this column existed
+    # -- see module docstring above.
+    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     task_run: Mapped["TaskRun"] = relationship(back_populates="issue_detection_run")  # noqa: F821
     issues: Mapped[list["Issue"]] = relationship(  # noqa: F821

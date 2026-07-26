@@ -40,6 +40,36 @@ class TaskType(str, enum.Enum):
     # file and has no approval state machine, closer in shape to SYNC's
     # CsvProfilingHandler than to TRANSFORM/STANDARDIZE/EXPORT.
     DETECT = "detect"
+    # Module 15: another new value, same reasoning as STANDARDIZE/MATCH/
+    # DETECT -- every existing value already means something specific.
+    # REMEDIATE consumes Module 14's Issue rows and proposes deterministic
+    # fixes; like DETECT it never writes an output file and has no
+    # approval state machine (see app.models.remediation_run) -- it
+    # persists proposals only, never a materialized cleaned dataset. See
+    # docs/module-15-deterministic-cleaning-engine-design.md.
+    REMEDIATE = "remediate"
+    # Module 17: another new value, same reasoning as DETECT/REMEDIATE --
+    # every existing value already means something specific. VALIDATE
+    # consumes the approved RemediationChange proposals from Module 16 and
+    # verifies each proposed value satisfies the intended remediation rule;
+    # like DETECT and REMEDIATE it never writes an output file, never
+    # modifies source data or upstream rows, and has no approval state
+    # machine -- it persists ValidationResult rows only. See
+    # docs/module-17-validation-engine-design.md.
+    VALIDATE = "validate"
+    # Module 18: another new value, same reasoning as DETECT/REMEDIATE/
+    # VALIDATE -- every existing value already means something specific.
+    # QUALITY_CTRL consumes the completed ValidationRun produced by Module 17
+    # and applies a configurable scoring model across 8 quality categories to
+    # produce a single authoritative release recommendation (PASS /
+    # PASS_WITH_WARNINGS / FAIL) for the post-remediation dataset. Like
+    # DETECT, REMEDIATE, and VALIDATE it never writes an output file, never
+    # modifies source data or upstream rows, and has no approval state
+    # machine -- it persists QualityControlRun + QualityFinding rows only.
+    # Phase 1: registered on NoOpHandler until Phase 3's real handler lands
+    # (same placeholder pattern DETECT/REMEDIATE/VALIDATE each passed through).
+    # See docs/module-18-quality-control-engine-design.md.
+    QUALITY_CTRL = "quality_ctrl"
 
 
 class TaskRunStatus(str, enum.Enum):
@@ -167,3 +197,128 @@ ISSUE_SEVERITIES = ("INFO", "LOW", "MEDIUM", "HIGH", "CRITICAL")
 # one of these when a rule explicitly says so -- never inferred from the
 # column's name or its data.
 ISSUE_DETECTION_EXPECTED_TYPES = ("email", "phone", "date", "numeric", "boolean")
+
+
+# Module 15: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as every closed vocabulary above, applied to
+# RemediationChange.action. remediation_runs has no approval state machine
+# at all (see app.models.remediation_run) -- like Module 14, this engine
+# only ever persists proposals, so there is no *_RUN_STATUSES tuple here.
+# See docs/module-15-deterministic-cleaning-engine-design.md Section 4 for
+# the full issue_type -> action mapping and which app.cleaning/
+# app.standardization function (if any) each action reuses.
+# Module 16: same "small, internal, closed vocabulary -> plain string"
+# precedent as every prior closed-vocabulary tuple in this file. Two
+# values only: "approved" and "rejected". No "pending" value -- pending
+# is represented by the ABSENCE of a RemediationChangeDecision row for a
+# given change, not by a third enum value. Cross-checked at model-import
+# time against ck_remediation_change_decisions_valid's CHECK constraint.
+REMEDIATION_CHANGE_DECISION_VALUES = ("approved", "rejected")
+
+REMEDIATION_ACTIONS = (
+    "trim_whitespace",
+    "collapse_multiple_spaces",
+    "standardize_capitalization",
+    "normalize_boolean",
+    "normalize_date",
+    "normalize_phone",
+    "normalize_numeric",
+    "normalize_enum_value",
+    "remove_duplicate_row",
+    "remove_duplicate_primary_key",
+)
+
+
+# Module 17: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as every closed vocabulary above. Three families:
+#   VALIDATION_OUTCOMES     — the three possible result outcomes.
+#   VALIDATION_RULE_NAMES   — the named validation rule that evaluated a
+#                             change; one entry per REMEDIATION_ACTION,
+#                             following the validate_<action> naming
+#                             convention. Cross-checked at import time
+#                             against VALIDATION_RULES in
+#                             app.validation.registry (Phase 2).
+#
+# No *_RUN_STATUSES tuple: ValidationRun has no approval state machine --
+# the engine never modifies anything, so there is nothing for a human to
+# approve, reject, or roll back (same reasoning as IssueDetectionRun and
+# RemediationRun). See docs/module-17-validation-engine-design.md Section 1.
+
+VALIDATION_OUTCOMES = ("passed", "failed", "skipped")
+
+VALIDATION_RULE_NAMES = (
+    "validate_trim_whitespace",
+    "validate_collapse_multiple_spaces",
+    "validate_standardize_capitalization",
+    "validate_normalize_boolean",
+    "validate_normalize_date",
+    "validate_normalize_phone",
+    "validate_normalize_numeric",
+    "validate_normalize_enum_value",
+    "validate_remove_duplicate_row",
+    "validate_remove_duplicate_primary_key",
+)
+
+assert len(VALIDATION_RULE_NAMES) == len(REMEDIATION_ACTIONS) == 10, (
+    "VALIDATION_RULE_NAMES must have exactly one entry per REMEDIATION_ACTION"
+)
+
+
+# Module 18: same "small, internal, worker/config-owned value set -> plain
+# string" precedent as every closed vocabulary above, applied to the quality
+# control engine's own categories, findings, and release decisions.
+# quality_control_runs/quality_findings have no approval state machine --
+# the engine is strictly read-only (same reasoning as IssueDetectionRun,
+# RemediationRun, and ValidationRun), so there is no *_RUN_STATUSES tuple.
+# See docs/module-18-quality-control-engine-design.md.
+#
+# Eight named quality categories -- two are always-skipped V1 placeholders
+# (referential_integrity: pending FK metadata; business_rule_compliance:
+# deferred to Module 21). The rest are active in V1. Ordered consistently
+# with Section 6 of the architecture document.
+QUALITY_CATEGORIES = (
+    "completeness",
+    "uniqueness",
+    "validity",
+    "consistency",
+    "referential_integrity",        # always skipped in V1 -- no finding emitted
+    "business_rule_compliance",     # deferred to Module 21 -- no finding emitted
+    "unresolved_risk",
+    "validation_coverage",
+)
+
+# lowercase (info/warning/blocking) to match this project's internal-state-
+# machine convention. 'blocking' is deliberately absent from ISSUE_SEVERITIES
+# (that vocabulary uses INFO/LOW/MEDIUM/HIGH/CRITICAL) -- quality findings
+# use their own closed set. Ordered least to most severe.
+QUALITY_FINDING_SEVERITIES = ("info", "warning", "blocking")
+
+# Three possible finding outcomes: passed, failed, skipped. Same closed set
+# as VALIDATION_OUTCOMES -- deliberate parallel naming. A skipped finding
+# means the rule's preconditions were not met (never a pass, never a fail).
+QUALITY_FINDING_OUTCOMES = ("passed", "failed", "skipped")
+
+# Three possible release recommendations. All uppercase to distinguish from
+# the lowercase internal-state-machine vocabulary. PASS_WITH_WARNINGS is the
+# middle ground: overall_score in [fail_threshold, pass_threshold) or any
+# non-blocking warning findings. FAIL is both the definitive rejection AND
+# the default for the no-applicable-categories case (overall_score = NULL).
+QUALITY_RELEASE_RECOMMENDATIONS = ("PASS", "PASS_WITH_WARNINGS", "FAIL")
+
+# Category-level statuses stored in QualityControlRun.category_statuses JSON.
+# 'skipped' is a category-level concept only (always-skipped categories produce
+# no QualityFinding -- the status here is sufficient audit evidence).
+QUALITY_CATEGORY_STATUSES = ("passed", "warning", "failed", "skipped")
+
+# Import-time cross-checks (same pattern as VALIDATION_RULE_NAMES assertion).
+assert len(QUALITY_CATEGORIES) == 8, (
+    "QUALITY_CATEGORIES must have exactly 8 entries (Section 6 of the "
+    "Module 18 architecture document)"
+)
+assert len(set(QUALITY_CATEGORIES)) == 8, "QUALITY_CATEGORIES must be unique"
+assert len(QUALITY_FINDING_SEVERITIES) == 3, "QUALITY_FINDING_SEVERITIES must have 3 entries"
+assert len(QUALITY_FINDING_OUTCOMES) == 3, "QUALITY_FINDING_OUTCOMES must have 3 entries"
+assert len(QUALITY_RELEASE_RECOMMENDATIONS) == 3, (
+    "QUALITY_RELEASE_RECOMMENDATIONS must have 3 entries"
+)
+assert len(QUALITY_CATEGORY_STATUSES) == 4, "QUALITY_CATEGORY_STATUSES must have 4 entries"

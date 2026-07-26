@@ -58,7 +58,47 @@ IssueDetectionHandler, replacing that placeholder -- the same
 purely-in-place swap Module 9 performed for EXPORT's own NoOpHandler
 placeholder. A Task with task_type=DETECT now executes real,
 strictly-read-only issue-detection logic against the data source's raw
-synced CSV instead of a no-op (see IssueDetectionHandler.execute)."""
+synced CSV instead of a no-op (see IssueDetectionHandler.execute).
+
+Module 15 Phase 1 update: another NEW TaskType value, REMEDIATE, was
+registered on NoOpHandler temporarily -- same placeholder pattern DETECT
+itself passed through in Module 14 Phase 1, keeping
+test_registry_has_a_handler_for_every_task_type
+(tests/test_worker_handlers.py) green while Module 15's database layer
+(models/migration/config only) landed ahead of its worker handler and
+API, by explicit, approved phase-scoping.
+
+Module 15 Phase 3 update: REMEDIATE now maps to the real
+RemediationHandler, replacing that placeholder -- the same
+purely-in-place swap Module 14 Phase 2 performed for DETECT's own
+NoOpHandler placeholder. A Task with task_type=REMEDIATE now executes
+real, strictly-read-only remediation-proposal logic against the upstream
+Module 14 IssueDetectionRun's Issues instead of a no-op (see
+RemediationHandler.execute).
+
+Module 17 Phase 1 update: another NEW TaskType value, VALIDATE, was
+registered on NoOpHandler temporarily -- same placeholder pattern DETECT
+and REMEDIATE both passed through, keeping
+test_registry_has_a_handler_for_every_task_type
+(tests/test_worker_handlers.py) green while Module 17's database layer
+(models/migration/config only) landed ahead of its worker handler and
+API, by explicit, approved phase-scoping.
+
+Module 17 Phase 3 update: VALIDATE now maps to the real
+ValidationHandler, replacing that placeholder -- the same purely-in-place
+swap Module 15 Phase 3 performed for REMEDIATE's own NoOpHandler
+placeholder. A Task with task_type=VALIDATE now executes real,
+strictly-read-only validation logic against the upstream Module 15
+RemediationRun's approved RemediationChange proposals instead of a no-op
+(see ValidationHandler.execute).
+
+Module 18 Phase 1 update: another NEW TaskType value, QUALITY_CTRL, is
+registered on NoOpHandler temporarily -- same placeholder pattern DETECT,
+REMEDIATE, and VALIDATE each passed through, keeping
+test_registry_has_a_handler_for_every_task_type
+(tests/test_worker_handlers.py) green while Module 18's database layer
+(models/migration/config only) lands ahead of its worker handler and API,
+by explicit, approved phase-scoping."""
 from app.models.enums import TaskType
 from app.worker.handlers.base import ExecutionHandler
 from app.worker.handlers.cleaning import CleaningHandler
@@ -67,7 +107,10 @@ from app.worker.handlers.issue_detection import IssueDetectionHandler
 from app.worker.handlers.matching import MatchHandler
 from app.worker.handlers.csv_profiling import CsvProfilingHandler
 from app.worker.handlers.noop import NoOpHandler
+from app.worker.handlers.quality_control import QualityControlHandler
+from app.worker.handlers.remediation import RemediationHandler
 from app.worker.handlers.standardization import StandardizationHandler
+from app.worker.handlers.validation import ValidationHandler
 
 HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.SYNC: CsvProfilingHandler(),
@@ -77,6 +120,10 @@ HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     TaskType.STANDARDIZE: StandardizationHandler(),
     TaskType.MATCH: MatchHandler(),
     TaskType.DETECT: IssueDetectionHandler(),
+    TaskType.REMEDIATE: RemediationHandler(),
+    TaskType.VALIDATE: ValidationHandler(),
+    # Module 18 Phase 3: NoOpHandler replaced with QualityControlHandler.
+    TaskType.QUALITY_CTRL: QualityControlHandler(),
 }
 
 
