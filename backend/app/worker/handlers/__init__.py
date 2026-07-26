@@ -98,7 +98,15 @@ REMEDIATE, and VALIDATE each passed through, keeping
 test_registry_has_a_handler_for_every_task_type
 (tests/test_worker_handlers.py) green while Module 18's database layer
 (models/migration/config only) lands ahead of its worker handler and API,
-by explicit, approved phase-scoping."""
+by explicit, approved phase-scoping.
+
+Module 20: another NEW TaskType value, REPORT, is registered on ReportHandler
+directly (no NoOpHandler placeholder needed -- the full handler, engine, model,
+migration, schemas, and tests all land together in a single phase). A Task with
+task_type=REPORT generates an immutable structured pipeline summary report from
+completed pipeline stage rows, stored as JSON in report_runs.report_data with
+no file artifact. Idempotency: UNIQUE(task_run_id) on report_runs. See
+app.worker.handlers.report.ReportHandler for the full algorithm."""
 from app.models.enums import TaskType
 from app.worker.handlers.apply_remediations import ApprovedChangesApplicatorHandler
 from app.worker.handlers.base import ExecutionHandler
@@ -110,6 +118,7 @@ from app.worker.handlers.csv_profiling import CsvProfilingHandler
 from app.worker.handlers.noop import NoOpHandler
 from app.worker.handlers.quality_control import QualityControlHandler
 from app.worker.handlers.remediation import RemediationHandler
+from app.worker.handlers.report import ReportHandler
 from app.worker.handlers.standardization import StandardizationHandler
 from app.worker.handlers.validation import ValidationHandler
 from app.worker.handlers.clean_export import CleanExportHandler
@@ -141,6 +150,12 @@ HANDLER_REGISTRY: dict[TaskType, ExecutionHandler] = {
     # The primary trigger is the API (POST /jobs/{job_id}/exports);
     # this handler supports worker-dispatched CLEAN_EXPORT TaskRuns.
     TaskType.CLEAN_EXPORT: CleanExportHandler(),
+    # Module 20: REPORT assembles a deterministic pipeline summary JSON
+    # (stored inline in report_runs.report_data -- no file artifact) from
+    # all completed pipeline stage rows for a given pipeline chain anchored
+    # to a QualityControlRun. Idempotency: UNIQUE(task_run_id) on report_runs,
+    # same as every prior run-summary table. See app.worker.handlers.report.
+    TaskType.REPORT: ReportHandler(),
 }
 
 

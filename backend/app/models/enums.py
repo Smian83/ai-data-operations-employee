@@ -91,6 +91,19 @@ class TaskType(str, enum.Enum):
     # post-remediation dataset on disk. It never modifies the ExportRun
     # artifact or any upstream row.
     APPLY_REMEDIATIONS = "apply_remediations"
+    # Module 20: another new value, same reasoning as every prior module --
+    # every existing value already means something specific. REPORT assembles
+    # a structured, deterministic pipeline summary report (JSON stored inline
+    # in report_runs.report_data -- no file artifact) from all completed
+    # pipeline stage rows for a given pipeline chain. Like DETECT, REMEDIATE,
+    # VALIDATE, and QUALITY_CTRL it never writes an output file and never
+    # modifies any upstream row. Unlike those "engine" modules, REPORT is
+    # purely aggregative: it reads already-persisted run rows and builds a
+    # structured summary that includes an executive summary, audit lineage,
+    # processing durations, quality improvement metrics, and error/warning
+    # counts. Idempotency: UNIQUE(task_run_id) on report_runs, same as every
+    # prior run-summary table. See docs/module-20-reports-analytics-design.md.
+    REPORT = "report"
 
 
 class TaskRunStatus(str, enum.Enum):
@@ -371,3 +384,16 @@ CLEAN_EXPORT_FORMATS = ("csv", "xlsx")
 
 assert len(CLEAN_EXPORT_STATUSES) == 6, "CLEAN_EXPORT_STATUSES must have 6 entries"
 assert len(CLEAN_EXPORT_FORMATS) == 2, "CLEAN_EXPORT_FORMATS must have 2 entries"
+
+
+# Module 20: Report engine version -- bumped when report_data schema or
+# aggregation logic changes.  Stored on every ReportRun row so the API
+# can surface the version that produced a given report.
+REPORT_ENGINE_VERSION: str = "1.0.0"
+
+# Module 20: report schema version -- embedded inside report_data JSON
+# (as report_schema_version) so future schema changes are forward-compatible
+# without a migration. Matches REPORT_ENGINE_VERSION in V1; may diverge
+# independently in future if only the data schema changes without an engine
+# change.
+REPORT_SCHEMA_VERSION: str = "1.0"

@@ -97,6 +97,8 @@ from app.schemas.remediation import (
 )
 from app.schemas.quality_control import QualityControlRunRead, QualityFindingRead
 from app.schemas.clean_export import CleanExportCreate, CleanExportRead
+from app.schemas.report import ReportRunRead
+from app.models.report_run import ReportRun
 from app.schemas.validation import ValidationResultRead, ValidationRunRead
 from app.schemas.match_skipped_block import MatchSkippedBlockRead
 from app.schemas.pagination import PaginatedResponse
@@ -3383,4 +3385,202 @@ def download_clean_export(
         iter_artifact_chunks(_fileobj),
         media_type=_media_type,
         headers={"Content-Disposition": f"attachment; filename={_filename!r}"},
+    )
+
+
+# =============================================================================
+# Module 20: Reports & Analytics — 3 read-only endpoints
+#
+#   GET  /{task_id}/runs/{run_id}/report          get a specific ReportRun
+#   GET  /{task_id}/report                        get the latest ReportRun
+#   GET  /{task_id}/runs/{run_id}/report/download stream report JSON
+#
+# The report is stored inline in ReportRun.report_data (no file artifact).
+# The download endpoint serializes that JSON column to bytes on the fly.
+# No POST endpoint needed -- reports are triggered via the existing
+# POST /tasks/{task_id}/runs with task_type="report".
+# =============================================================================
+
+
+def _get_report_run_or_404(
+    db: Session, task_id: uuid.UUID, run_id: uuid.UUID, org_id: uuid.UUID
+) -> tuple[ReportRun, TaskRun]:
+    """Shared 404 chain for every report endpoint: task visible → run visible
+    → report result exists. Same pattern as _get_quality_control_run_or_404."""
+    task = _get_active_task_or_404(db, task_id, org_id)
+    task_run = db.execute(
+        select(TaskRun).where(
+            TaskRun.id == run_id,
+            TaskRun.task_id == task.id,
+            TaskRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if task_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Task run not found"
+        )
+
+    report_run = db.execute(
+        select(ReportRun).where(
+            ReportRun.task_run_id == run_id,
+            ReportRun.task_id == task.id,
+            ReportRun.organization_id == org_id,
+        )
+    ).scalar_one_or_none()
+    if report_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report result not found",
+        )
+    return report_run, task_run
+
+
+def _report_run_to_read(
+    report_run: ReportRun, task_run: TaskRun
+) -> ReportRunRead:
+    """Convert ORM row + TaskRun to the API DTO."""
+    processing_duration_ms: int | None = None
+    if task_run.started_at is not None and task_run.finished_at is not None:
+        processing_duration_ms = round(
+            (task_run.finished_at - task_run.started_at).total_seconds() * 1000
+        )
+    return ReportRunRead(
+        id=report_run.id,
+        organization_id=report_run.organization_id,
+        task_run_id=report_run.task_run_id,
+        task_id=report_run.task_id,
+        data_source_id=report_run.data_source_id,
+        quality_control_run_id=report_run.quality_control_run_id,
+        report_engine_version=report_run.report_engine_version,
+        report_schema_version=report_run.report_schema_version,
+        report_data=report_run.report_data,
+        processing_duration_ms=processing_duration_ms,
+        created_at=report_run.created_at,
+    )
+
+
+@router.get(
+    "/{task_id}/runs/{run_id}/report",
+    response_model=ReportRunRead,
+)
+def get_task_run_report(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ReportRunRead:
+    """Module 20: the pipeline summary report for a REPORT TaskRun.
+
+    Returns the full structured report_data JSON inline together with the
+    run metadata. All fields were pre-computed by ReportHandler — no
+    aggregation at query time.
+    processing_duration_ms is derived from TaskRun.started_at/finished_at.
+
+    404 if the task, run, or report result is not found for this org.
+    Tenant isolation: three-layer 404 chain, all queries org-scoped."""
+    report_run, task_run = _get_report_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+    return _report_run_to_read(report_run, task_run)
+
+
+@router.get(
+    "/{task_id}/report",
+    response_model=ReportRunRead,
+)
+def get_latest_task_report(
+    task_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> ReportRunRead:
+    """Module 20: the latest pipeline summary report for a task.
+
+    Convenience endpoint -- returns the most recently created ReportRun for
+    this task, regardless of which REPORT TaskRun produced it. Useful for
+    dashboard / status-page use cases where the caller wants current state
+    without enumerating task runs.
+
+    404 if no completed ReportRun exists for this task / org."""
+    _get_active_task_or_404(db, task_id, current_user.organization_id)
+
+    report_run = db.execute(
+        select(ReportRun)
+        .where(
+            ReportRun.task_id == task_id,
+            ReportRun.organization_id == current_user.organization_id,
+        )
+        .order_by(ReportRun.created_at.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+    if report_run is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No report found for this task",
+        )
+
+    # Load the corresponding TaskRun for duration computation.
+    task_run = db.execute(
+        select(TaskRun).where(
+            TaskRun.id == report_run.task_run_id,
+            TaskRun.organization_id == current_user.organization_id,
+        )
+    ).scalar_one_or_none()
+
+    if task_run is None:
+        # Defensive: the TaskRun was CASCADE-deleted (extremely unlikely given
+        # FK ondelete=CASCADE on report_runs, but guard anyway).
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report task run not found",
+        )
+
+    return _report_run_to_read(report_run, task_run)
+
+
+@router.get("/{task_id}/runs/{run_id}/report/download")
+def download_task_run_report(
+    task_id: uuid.UUID,
+    run_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+) -> StreamingResponse:
+    """Module 20: stream the pipeline report as a downloadable JSON file.
+
+    The report_data column is serialized to UTF-8 JSON bytes on the fly --
+    no file is ever written to disk. No SHA-256 integrity verification step
+    (no artifact file to verify against; the data comes directly from the
+    immutable DB column).
+
+    Content-Type: application/json
+    Content-Disposition: attachment; filename="report_{run_id}.json"
+
+    404 if the task, run, or report result is not found for this org."""
+    import json as _json
+
+    report_run, _ = _get_report_run_or_404(
+        db, task_id, run_id, current_user.organization_id
+    )
+
+    # Serialize to JSON bytes.  indent=2 for human readability; separators
+    # default to (", ", ": ") which is compact enough for machine consumption.
+    report_bytes: bytes = _json.dumps(
+        report_run.report_data, ensure_ascii=False, indent=2
+    ).encode("utf-8")
+
+    filename = f"report_{run_id}.json"
+
+    def _stream_json() -> Iterator[bytes]:
+        # Yield in one shot -- the report JSON is always small enough to fit in
+        # memory (it's a DB column, not a file). A single yield avoids overhead
+        # from chunking logic that would not benefit the actual payload size.
+        yield report_bytes
+
+    return StreamingResponse(
+        _stream_json(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(len(report_bytes)),
+        },
     )

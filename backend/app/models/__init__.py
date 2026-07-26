@@ -39,3 +39,4 @@ from app.models.quality_control_run import QualityControlRun  # noqa: F401
 from app.models.quality_finding import QualityFinding  # noqa: F401
 from app.models.quality_threshold import QualityThreshold  # noqa: F401
 from app.models.clean_export import CleanExport  # noqa: F401
+from app.models.report_run import ReportRun  # noqa: F401
