@@ -39,6 +39,7 @@ from app.models.issue_detection_run import IssueDetectionRun
 from app.profiling.csv_loader import CsvLoadError, load_csv, resolve_source_path
 from app.profiling.types import CsvLimits
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 
 
 class IssueDetectionHandler:
@@ -98,12 +99,24 @@ class IssueDetectionHandler:
                     f"total_issues_found={existing.total_issues_found}"
                 )
 
+            # Module 21: load resolved business rules
+            resolved_rules = load_resolved_rules(
+                db,
+                context.task_run.organization_id,
+                data_source.id,
+            )
+            # Override the settings-level default z-score threshold if configured
+            effective_zscore = resolved_rules.resolved_rules.get(
+                "detection.outlier_zscore_threshold",
+                settings.issue_detection_outlier_zscore_threshold,
+            )
+
             column_rules = self._load_column_rules(
                 db,
                 context.task_run.organization_id,
                 data_source.id,
                 loaded.headers,
-                settings.issue_detection_outlier_zscore_threshold,
+                effective_zscore,
             )
             dataset = DetectionDataset(
                 headers=loaded.headers,
@@ -139,9 +152,8 @@ class IssueDetectionHandler:
                 issues_by_type=result.issues_by_type,
                 limits_applied={
                     "max_persisted_issues": limits.max_persisted_issues,
-                    "default_outlier_zscore_threshold": (
-                        settings.issue_detection_outlier_zscore_threshold
-                    ),
+                    "default_outlier_zscore_threshold": effective_zscore,
+                    "rule_set_id": str(resolved_rules.rule_set_id) if resolved_rules.rule_set_id else None,
                 },
                 detection_engine_version=DETECTION_ENGINE_VERSION,
                 # Module 15 addition: already computed by load_csv, simply
@@ -180,6 +192,18 @@ class IssueDetectionHandler:
                 detection_run = existing
             else:
                 db.refresh(detection_run)
+                # Module 21: write rule set run audit record
+                try:
+                    write_rule_set_run(
+                        db,
+                        context.task_run.organization_id,
+                        resolved_rules,
+                        "issue_detection",
+                        detection_run.id,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             return (
                 f"issue detection run created: detection_run_id={detection_run.id} "

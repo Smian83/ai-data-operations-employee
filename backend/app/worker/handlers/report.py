@@ -65,6 +65,7 @@ from app.models.task import Task
 from app.models.task_run import TaskRun
 from app.models.validation_run import ValidationRun
 from app.reports.engine import ReportInput, build_report
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
 
 logger = logging.getLogger(__name__)
@@ -382,6 +383,13 @@ class ReportHandler:
             if hasattr(context, "user") and context.user is not None:
                 generated_by = getattr(context.user, "email", "system")
 
+            # Module 21: load resolved business rules
+            resolved_rules = load_resolved_rules(
+                db,
+                organization_id,
+                data_source_id,
+            )
+
             # ── Step 7: Build report data via pure engine ──────────────────
             report_input = ReportInput(
                 organization_id=organization_id,
@@ -410,6 +418,11 @@ class ReportHandler:
                 rejected_decision_count=rejected_decisions,
                 pending_decision_count=pending_decisions,
                 failed_task_runs=list(failed_task_runs),
+                # Module 21: business rule metadata
+                business_rule_set_id=resolved_rules.rule_set_id,
+                business_rule_set_version=resolved_rules.rule_set_version,
+                business_rule_schema_version=resolved_rules.rule_schema_version,
+                business_rule_resolver_version=resolved_rules.resolver_version,
             )
             report_data = build_report(report_input)
 
@@ -445,6 +458,18 @@ class ReportHandler:
                     raise
             else:
                 db.refresh(report_run)
+                # Module 21: write rule set run audit record
+                try:
+                    write_rule_set_run(
+                        db,
+                        organization_id,
+                        resolved_rules,
+                        "report",
+                        report_run.id,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             pipeline_status = report_data.get("job_summary", {}).get(
                 "overall_status", "unknown"

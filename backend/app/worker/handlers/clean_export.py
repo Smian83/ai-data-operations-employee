@@ -25,10 +25,14 @@ from collections.abc import Callable
 
 from sqlalchemy.orm import Session
 
+from sqlalchemy import select
+
 from app.clean_export.service import ExportService
 from app.clean_export.types import CleanExportRequest
 from app.db.session import SessionLocal
+from app.models.clean_export import CleanExport
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 
 
 class CleanExportHandler:
@@ -72,7 +76,50 @@ class CleanExportHandler:
 
         db = self._session_factory()
         try:
+            # Module 21: load resolved business rules before running export
+            resolved_rules = load_resolved_rules(db, organization_id, data_source_id)
+            rr = resolved_rules.resolved_rules
+
             clean_export = self._export_service.run(db, request)
+
+            # Module 21: if the export completed, check business rule constraints
+            if clean_export.status == "completed":
+                require_zero_critical = rr.get("export.require_zero_critical", False)
+                min_quality_score = rr.get("export.min_quality_score", 0.0)
+                # Check against QCR overall_score if available
+                if require_zero_critical or min_quality_score > 0.0:
+                    # Load the QCR for this export to check score
+                    if hasattr(clean_export, "dataset_version") and clean_export.dataset_version:
+                        from app.models.quality_control_run import QualityControlRun
+                        qcr = db.execute(
+                            select(QualityControlRun).where(
+                                QualityControlRun.id == clean_export.dataset_version,
+                                QualityControlRun.organization_id == organization_id,
+                            )
+                        ).scalar_one_or_none()
+                        if qcr is not None:
+                            score_fraction = (qcr.overall_score or 0.0) / 100.0
+                            if require_zero_critical and qcr.blocking_count > 0:
+                                clean_export.status = "blocked"
+                                clean_export.failure_reason = "business_rule:require_zero_critical"
+                                db.commit()
+                            elif score_fraction < min_quality_score:
+                                clean_export.status = "blocked"
+                                clean_export.failure_reason = f"business_rule:min_quality_score:{score_fraction:.3f}<{min_quality_score}"
+                                db.commit()
+
+            # Module 21: write audit row
+            try:
+                write_rule_set_run(
+                    db,
+                    organization_id,
+                    resolved_rules,
+                    "clean_export",
+                    clean_export.id,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
         finally:
             db.close()
 

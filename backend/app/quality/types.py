@@ -179,6 +179,7 @@ class QualityEngineInput:
     issues: tuple[IssueSnapshot, ...]
     thresholds: QualityThresholdConfig
     limits: QualityLimits
+    business_rule_set: object | None = None  # ResolvedRuleSet from app.rules.resolver, or None
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +249,4 @@ class QualityEngineResult:
     category_scores: dict[str, float]       # absent = skipped
     category_statuses: dict[str, str]       # all 8 always present
     category_weights_used: dict[str, float]  # only applicable categories
+

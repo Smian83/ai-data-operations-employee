@@ -68,6 +68,7 @@ from app.remediation.types import (
     RemediationLimits,
 )
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 
 
 class RemediationHandler:
@@ -153,6 +154,13 @@ class RemediationHandler:
                     f"total_changes_count={existing.total_changes_count} "
                     f"issues_skipped_count={existing.issues_skipped_count}"
                 )
+
+            # Module 21: load resolved business rules (informational for now)
+            resolved_rules = load_resolved_rules(
+                db,
+                context.task_run.organization_id,
+                data_source.id,
+            )
 
             configured_path = data_source.connection_metadata.get("file_path")
             if not isinstance(configured_path, str):
@@ -272,6 +280,18 @@ class RemediationHandler:
                 remediation_run = existing
             else:
                 db.refresh(remediation_run)
+                # Module 21: write rule set run audit record
+                try:
+                    write_rule_set_run(
+                        db,
+                        context.task_run.organization_id,
+                        resolved_rules,
+                        "remediation",
+                        remediation_run.id,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             return (
                 f"remediation run created: remediation_run_id={remediation_run.id} "

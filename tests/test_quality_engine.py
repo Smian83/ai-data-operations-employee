@@ -649,10 +649,15 @@ class TestAlwaysSkippedCategories:
         inputs = _make_inputs()
         assert rule.is_applicable(inputs) is False
 
-    def test_business_rule_compliance_evaluate_raises(self):
+    def test_business_rule_compliance_evaluate_returns_result(self):
+        # Module 21 replaced the stub with a real implementation.
+        # Calling evaluate() directly (even with business_rule_set=None) returns
+        # a CategoryEvaluationResult — the engine guards with is_applicable() first.
         rule = _RULES_BY_CATEGORY["business_rule_compliance"]
-        with pytest.raises(NotImplementedError):
-            rule.evaluate(_make_inputs())
+        from app.quality.types import CategoryEvaluationResult
+        result = rule.evaluate(_make_inputs())
+        assert isinstance(result, CategoryEvaluationResult)
+        assert result.score == 100.0  # no rules configured → all pass
 
     def test_always_skipped_in_engine_result(self):
         # When always-skipped categories are in the result, they appear

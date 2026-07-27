@@ -88,6 +88,7 @@ from app.quality.types import (
     ValidationRunSnapshot,
 )
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 
 # Issue types that indicate a missing-value problem; matching these lets
 # the handler decrement effective_missing_value_total correctly.
@@ -181,12 +182,34 @@ class QualityControlHandler:
                     f"recommendation={existing.release_recommendation}"
                 )
 
+            # Module 21: load resolved business rules
+            resolved_rules = load_resolved_rules(
+                db,
+                organization_id,
+                data_source.id,
+            )
+
             # ── Step 3: Pre-engine threshold configuration validation ───────
             # Resolve effective threshold (data-source-specific → org-wide →
             # PermanentExecutionError).  Validate all threshold fields before
             # calling the engine — invalid config is not passed to the engine.
             threshold_row, threshold_config, threshold_source = \
                 self._resolve_threshold(db, organization_id, data_source.id)
+            # Module 21: if no threshold DB row exists, supplement from rule set
+            if threshold_row is None:
+                rr = resolved_rules.resolved_rules
+                threshold_config = QualityThresholdConfig(
+                    pass_score_threshold=rr.get("quality.pass_score_threshold", threshold_config.pass_score_threshold) * 100,
+                    fail_score_threshold=rr.get("quality.fail_score_threshold", threshold_config.fail_score_threshold) * 100,
+                    max_validation_failure_rate=threshold_config.max_validation_failure_rate,
+                    max_validation_skip_rate=threshold_config.max_validation_skip_rate,
+                    max_high_severity_unresolved=int(rr.get("quality.max_high_unresolved", threshold_config.max_high_severity_unresolved)),
+                    max_critical_severity_unresolved=int(rr.get("quality.max_critical_unresolved", threshold_config.max_critical_severity_unresolved)),
+                    max_warnings_for_clean_pass=threshold_config.max_warnings_for_clean_pass,
+                    category_weights=threshold_config.category_weights,
+                    threshold_config_id=None,
+                    threshold_config_source="built_in_defaults",
+                )
             self._validate_threshold_config(threshold_config)
 
             # ── Step 4: Batch-load all prerequisites ───────────────────────
@@ -444,6 +467,18 @@ class QualityControlHandler:
                 qc_run = existing
             else:
                 db.refresh(qc_run)
+                # Module 21: write rule set run audit record
+                try:
+                    write_rule_set_run(
+                        db,
+                        organization_id,
+                        resolved_rules,
+                        "quality_control",
+                        qc_run.id,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             return (
                 f"quality control run created: "

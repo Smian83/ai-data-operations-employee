@@ -397,3 +397,38 @@ REPORT_ENGINE_VERSION: str = "1.0.0"
 # independently in future if only the data schema changes without an engine
 # change.
 REPORT_SCHEMA_VERSION: str = "1.0"
+
+
+# Module 21: Business Rules Engine — closed vocabularies for rule types,
+# sources, and pipeline run types. Same "small, internal, closed vocabulary
+# -> plain string" precedent as every prior tuple above. These are shared
+# across the 4 new business_rule_* tables, the resolver, and the API schema
+# layer, so they live here rather than in a single owning model file.
+
+# The five rule categories an org can configure.
+BUSINESS_RULE_TYPES = (
+    "threshold",          # numeric thresholds (outlier z-score, quality scores)
+    "toggle",             # boolean on/off flags
+    "preference",         # string choice from a fixed set
+    "list",               # list of strings (required columns, blocked columns)
+    "severity_override",  # map issue_type -> severity
+)
+
+# Where a rule value originates.
+BUSINESS_RULE_SOURCES = ("builtin", "organization", "future_ai")
+
+# Pipeline run types that generate a BusinessRuleSetRun audit record.
+BUSINESS_RULE_PIPELINE_RUN_TYPES = (
+    "issue_detection",
+    "remediation",
+    "validation",
+    "quality_control",
+    "clean_export",
+    "report",
+)
+
+assert len(BUSINESS_RULE_TYPES) == 5, "BUSINESS_RULE_TYPES must have 5 entries"
+assert len(BUSINESS_RULE_SOURCES) == 3, "BUSINESS_RULE_SOURCES must have 3 entries"
+assert len(BUSINESS_RULE_PIPELINE_RUN_TYPES) == 6, (
+    "BUSINESS_RULE_PIPELINE_RUN_TYPES must have 6 entries"
+)

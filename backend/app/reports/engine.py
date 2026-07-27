@@ -77,6 +77,12 @@ class ReportInput:
     # ---- Failed TaskRuns for the error/warning section ----
     failed_task_runs: list[Any] = field(default_factory=list)
 
+    # ---- Module 21: Business rule set metadata (all optional) ----
+    business_rule_set_id: Any | None = None           # uuid.UUID | None
+    business_rule_set_version: int | None = None
+    business_rule_schema_version: str | None = None
+    business_rule_resolver_version: str | None = None
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -430,6 +436,15 @@ def build_report(inp: ReportInput) -> dict[str, Any]:
 
         # ---- Audit lineage ----
         "audit_lineage": audit_lineage,
+
+        # ---- Business rules metadata (Module 21) ----
+        "business_rules": {
+            "rule_set_id": str(inp.business_rule_set_id) if inp.business_rule_set_id is not None else None,
+            "rule_set_version": inp.business_rule_set_version,
+            "rule_schema_version": inp.business_rule_schema_version,
+            "resolver_version": inp.business_rule_resolver_version,
+            "applied": inp.business_rule_set_id is not None or inp.business_rule_resolver_version is not None,
+        },
     }
 
     return report

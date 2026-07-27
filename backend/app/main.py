@@ -15,6 +15,7 @@ from app.api.health import router as health_router
 from app.api.internal import router as internal_router
 from app.api.review_queue import router as review_queue_router
 from app.api.tasks import router as tasks_router
+from app.api.business_rules import router as business_rules_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging
 
@@ -50,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router)
     app.include_router(review_queue_router)
     app.include_router(internal_router)
+    app.include_router(business_rules_router)
 
     return app
 

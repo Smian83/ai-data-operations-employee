@@ -82,6 +82,7 @@ from app.validation.types import (
     ValidationLimits,
 )
 from app.worker.handlers.base import ExecutionContext, PermanentExecutionError
+from app.rules.handler_utils import load_resolved_rules, write_rule_set_run
 
 
 class ValidationHandler:
@@ -183,6 +184,13 @@ class ValidationHandler:
                     f"failed_count={existing.failed_count} "
                     f"skipped_count={existing.skipped_count}"
                 )
+
+            # Module 21: load resolved business rules
+            resolved_rules = load_resolved_rules(
+                db,
+                organization_id,
+                data_source.id,
+            )
 
             # Step 3a: batch-load ALL RemediationChange rows for this run,
             # org-scoped. No N+1: single query, scalars fetched in one pass.
@@ -335,6 +343,18 @@ class ValidationHandler:
                 validation_run = existing
             else:
                 db.refresh(validation_run)
+                # Module 21: write rule set run audit record
+                try:
+                    write_rule_set_run(
+                        db,
+                        organization_id,
+                        resolved_rules,
+                        "validation",
+                        validation_run.id,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
 
             return (
                 f"validation run created: "
