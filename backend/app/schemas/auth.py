@@ -96,6 +96,45 @@ class Token(BaseModel):
     token_type: str = "bearer"
 
 
+class AuthResponse(BaseModel):
+    access_token: str | None = None
+    token_type: str = "bearer"
+    requires_2fa_setup: bool = False
+    requires_2fa: bool = False
+    pre_auth_token: str | None = None
+
+
+class TotpCodeRequest(BaseModel):
+    code: str = Field(min_length=6, max_length=6, pattern=r"^\d{6}$")
+
+
+class RecoveryCodeRequest(BaseModel):
+    recovery_code: str = Field(min_length=7, max_length=32)
+
+
+class TwoFactorSetupResponse(BaseModel):
+    secret: str
+    provisioning_uri: str
+
+
+class TwoFactorVerifyResponse(Token):
+    recovery_codes: list[str] | None = None
+
+
+class TwoFactorStatusResponse(BaseModel):
+    enabled: bool
+    required: bool
+    recovery_codes_remaining: int
+
+
+class TwoFactorManageRequest(TotpCodeRequest):
+    password: str
+
+
+class RecoveryCodesResponse(BaseModel):
+    recovery_codes: list[str]
+
+
 class TokenPayload(BaseModel):
     sub: uuid.UUID
     org_id: uuid.UUID

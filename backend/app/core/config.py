@@ -73,6 +73,14 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = Field(
         default=60, alias="ACCESS_TOKEN_EXPIRE_MINUTES"
     )
+    pre_auth_token_expire_minutes: int = Field(
+        default=10, alias="PRE_AUTH_TOKEN_EXPIRE_MINUTES", ge=1, le=30
+    )
+    totp_encryption_key: str | None = Field(default=None, alias="TOTP_ENCRYPTION_KEY")
+    auth_rate_limit_attempts: int = Field(default=5, alias="AUTH_RATE_LIMIT_ATTEMPTS", ge=1)
+    auth_rate_limit_window_minutes: int = Field(
+        default=5, alias="AUTH_RATE_LIMIT_WINDOW_MINUTES", ge=1
+    )
 
     # --- Worker / execution engine (Module 4) ---
     # Fernet key (32 url-safe base64-encoded bytes) used to encrypt

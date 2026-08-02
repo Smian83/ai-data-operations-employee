@@ -23,14 +23,32 @@ def _register(client: TestClient, **overrides) -> dict:
     return client.post("/auth/register", json=payload)
 
 
+def _finish_admin_setup(client: TestClient, registration_response) -> str:
+    from app.core.security import totp_code
+
+    pre_auth = registration_response.json()["pre_auth_token"]
+    headers = {"Authorization": f"Bearer {pre_auth}"}
+    setup = client.post("/auth/2fa/setup", headers=headers)
+    assert setup.status_code == 200
+    verified = client.post(
+        "/auth/2fa/setup/verify",
+        headers=headers,
+        json={"code": totp_code(setup.json()["secret"])},
+    )
+    assert verified.status_code == 200
+    return verified.json()["access_token"]
+
+
 # --- Registration ------------------------------------------------------------
 
 
-def test_register_creates_org_and_returns_token(client: TestClient) -> None:
+def test_register_creates_org_and_requires_admin_2fa_setup(client: TestClient) -> None:
     resp = _register(client)
     assert resp.status_code == 201
     body = resp.json()
-    assert "access_token" in body
+    assert body["access_token"] is None
+    assert body["requires_2fa_setup"] is True
+    assert "pre_auth_token" in body
     assert body["token_type"] == "bearer"
     assert "password" not in body
     assert "hashed_password" not in body
@@ -39,7 +57,7 @@ def test_register_creates_org_and_returns_token(client: TestClient) -> None:
 def test_register_normalizes_email_and_derives_slug(client: TestClient) -> None:
     resp = _register(client, organization_name="Acme Corp")
     assert resp.status_code == 201
-    token = resp.json()["access_token"]
+    token = _finish_admin_setup(client, resp)
 
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert me.status_code == 200
@@ -219,7 +237,7 @@ def test_me_rejects_garbage_token(client: TestClient) -> None:
 
 def test_me_returns_current_user_with_valid_token(client: TestClient) -> None:
     reg = _register(client, organization_name="Me Org", email="me@example.com")
-    token = reg.json()["access_token"]
+    token = _finish_admin_setup(client, reg)
 
     resp = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
@@ -283,7 +301,7 @@ def test_inactive_user_cannot_access_me(client: TestClient, db_session) -> None:
     from app.models.user import User
 
     reg = _register(client, organization_name="Inactive Org 2", email="inactive2@example.com")
-    token = reg.json()["access_token"]
+    token = _finish_admin_setup(client, reg)
 
     user = db_session.query(User).filter(User.email == "inactive2@example.com").one()
     user.is_active = False
@@ -298,7 +316,7 @@ def test_inactive_user_cannot_access_me(client: TestClient, db_session) -> None:
 
 def test_password_hash_never_in_any_auth_response_body(client: TestClient) -> None:
     reg = _register(client, organization_name="Leak Check Org", email="leak@example.com")
-    token = reg.json()["access_token"]
+    token = _finish_admin_setup(client, reg)
 
     me = client.get("/auth/me", headers={"Authorization": f"Bearer {token}"})
 

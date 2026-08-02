@@ -40,6 +40,8 @@ def get_current_user(
     except jwt.PyJWTError:
         raise _CREDENTIALS_EXCEPTION
 
+    if payload.get("token_type", "access") != "access":
+        raise _CREDENTIALS_EXCEPTION
     raw_user_id = payload.get("sub")
     org_id = payload.get("org_id")
     if not raw_user_id or not org_id:
@@ -63,6 +65,8 @@ def get_current_user(
             "Token org_id mismatch for user %s: token=%s actual=%s",
             user_id, org_id, user.organization_id,
         )
+        raise _CREDENTIALS_EXCEPTION
+    if payload.get("auth_version", 1) != user.auth_version:
         raise _CREDENTIALS_EXCEPTION
 
     return user

@@ -2,7 +2,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, UniqueConstraint, Uuid, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, UniqueConstraint, Uuid, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -28,6 +28,10 @@ class User(Base):
     full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=True)
     is_superuser: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
+    totp_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary(), nullable=True)
+    totp_enabled: Mapped[bool] = mapped_column(Boolean(), nullable=False, default=False)
+    totp_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    auth_version: Mapped[int] = mapped_column(Integer(), nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

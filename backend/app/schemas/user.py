@@ -15,4 +15,5 @@ class UserRead(BaseModel):
     full_name: str | None
     is_active: bool
     is_superuser: bool
+    totp_enabled: bool
     created_at: datetime
